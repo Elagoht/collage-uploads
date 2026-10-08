@@ -61,6 +61,9 @@ func TestCleanName(t *testing.T) {
 		{"", ""},
 		{"plain.txt", "plain.txt"},
 		{"bad\xffutf8.txt", "badutf8.txt"},
+		{"evil\u202egnp.exe", "evilgnp.exe"},
+		{"line\u2028sep\u2029para.txt", "lineseppara.txt"},
+		{"zero\u200bwidth\ufeff.txt", "zerowidth.txt"},
 	}
 	for _, c := range cases {
 		if got := cleanName(c.in); got != c.want {
@@ -81,7 +84,10 @@ func TestCleanName(t *testing.T) {
 }
 
 func TestValidKey(t *testing.T) {
-	good := []string{"0123456789abcdef0123456789abcdef.png", "report.pdf", "a"}
+	good := []string{
+		"0123456789abcdef0123456789abcdef.png", "report.pdf", "a", "a_b-c.tar.gz",
+		"console.txt", "com0.txt", "com10", "lpt.txt", "nul_x",
+	}
 	for _, k := range good {
 		if !validKey(k) {
 			t.Errorf("validKey(%q) = false, want true", k)
@@ -90,6 +96,8 @@ func TestValidKey(t *testing.T) {
 	bad := []string{
 		"", ".", "..", "../x", "a/b", `a\b`, "x\n", "x\x00", "x\x7f",
 		".upload-123", ".hidden", "a..b", "bad\xff", strings.Repeat("a", 256),
+		"CON", "con", "nul.png", "Nul.tar.gz", "prn", "aux.txt", "com1", "com9.bin", "lpt1", "lpt9.png",
+		"x:y", "x.", "X.PNG", "Report.pdf", "çiçek.png", "x ", "a b", "a+b", "a%2f",
 	}
 	for _, k := range bad {
 		if validKey(k) {

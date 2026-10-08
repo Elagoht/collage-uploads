@@ -48,7 +48,9 @@ func extensionFor(contentType string) string {
 
 // cleanName turns a client-supplied file name into something safe to show or
 // keep as metadata. It is never used as a path. It keeps only the part after
-// the last "/" or "\", drops invalid UTF-8 and control characters, maps "."
+// the last "/" or "\", drops invalid UTF-8, control characters (Cc), format
+// characters (Cf, such as U+202E RIGHT-TO-LEFT OVERRIDE) and line and
+// paragraph separators (Zl, Zp), maps "."
 // and ".." to "", and truncates to 255 bytes on a rune boundary.
 func cleanName(name string) string {
 	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
@@ -56,7 +58,7 @@ func cleanName(name string) string {
 	}
 	name = strings.ToValidUTF8(name, "")
 	name = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
 			return -1
 		}
 		return r
@@ -74,21 +76,43 @@ func cleanName(name string) string {
 	return name
 }
 
-// validKey reports whether key is safe to join to a store's directory. It
-// refuses the empty key, keys longer than 255 bytes, invalid UTF-8, "/", "\",
-// "..", control characters, and a leading "." (which also covers "." itself
-// and keeps Put's ".upload-*" temp files unreachable by key).
+// validKey reports whether key is safe to join to a store's directory on any
+// operating system. It is an explicit allowlist, the same on every OS, rather
+// than filepath.IsLocal, whose answer differs between Unix and Windows. A key:
+//   - is 1 to 255 bytes of [a-z0-9_.-] only (no uppercase, so two keys never
+//     name one file on a case-insensitive filesystem);
+//   - neither starts nor ends with "." (a leading dot keeps Put's ".upload-*"
+//     temp files unreachable; Windows drops a trailing one) and has no "..";
+//   - is not a Windows reserved device name (con, prn, aux, nul, com1-9,
+//     lpt1-9), with or without an extension.
+//
+// Every key newKey returns passes.
 func validKey(key string) bool {
-	if key == "" || len(key) > maxNameBytes || !utf8.ValidString(key) {
+	if key == "" || len(key) > maxNameBytes {
 		return false
 	}
-	if key[0] == '.' || strings.Contains(key, "..") || strings.ContainsAny(key, `/\`) {
-		return false
-	}
-	for _, r := range key {
-		if unicode.IsControl(r) {
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if !('a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '_' || c == '.' || c == '-') {
 			return false
 		}
 	}
-	return true
+	if key[0] == '.' || key[len(key)-1] == '.' || strings.Contains(key, "..") {
+		return false
+	}
+	return !windowsReserved(key)
+}
+
+// windowsReserved reports whether key's part before the first "." is a
+// Windows device name. Windows opens the device for "nul" and "nul.png" alike.
+func windowsReserved(key string) bool {
+	stem, _, _ := strings.Cut(strings.ToLower(key), ".")
+	switch stem {
+	case "con", "prn", "aux", "nul":
+		return true
+	}
+	if len(stem) == 4 && (strings.HasPrefix(stem, "com") || strings.HasPrefix(stem, "lpt")) {
+		return '1' <= stem[3] && stem[3] <= '9'
+	}
+	return false
 }

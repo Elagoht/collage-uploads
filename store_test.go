@@ -134,7 +134,8 @@ func TestDir_BadKeys(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	s := Dir(dir)
-	keys := []string{"", "../x", "a/b", `a\b`, "..", "x\n", "x\x00", ".", ".upload-x"}
+	keys := []string{"", "../x", "a/b", `a\b`, "..", "x\n", "x\x00", ".", ".upload-x",
+		"CON", "nul.png", "x:y", "x.", "X.PNG", "çiçek.png", "x "}
 	for _, key := range keys {
 		if _, err := s.Put(ctx, key, strings.NewReader("x")); !errors.Is(err, ErrBadKey) {
 			t.Errorf("Put(%q): %v, want ErrBadKey", key, err)
@@ -340,5 +341,163 @@ func TestDir_LinkExistsIsErrExists(t *testing.T) {
 	}
 	if got := leftovers(t, dir); len(got) != 0 {
 		t.Errorf("temp files left: %v", got)
+	}
+}
+
+// A directory that already exists with group or other bits is tightened to
+// 0700 on the next Put.
+func TestDir_TightensLooseDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permissions")
+	}
+	dir := filepath.Join(t.TempDir(), "loose")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Dir(dir).Put(context.Background(), "t.txt", strings.NewReader("x")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	di, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := di.Mode().Perm(); got != 0o700 {
+		t.Errorf("directory mode = %o, want 700", got)
+	}
+}
+
+func TestDir_OpenRefusesDirAndSymlink(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	dir := filepath.Join(base, "uploads")
+	s := Dir(dir)
+	if _, err := s.Put(ctx, "real.txt", strings.NewReader("inside")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "secret.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	links := map[string]string{"out.txt": outside, "in.txt": "real.txt"}
+	for name, to := range links {
+		if err := os.Symlink(to, filepath.Join(dir, name)); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+	}
+	for _, key := range []string{"sub", "out.txt", "in.txt"} {
+		rc, err := s.Open(ctx, key)
+		if err == nil {
+			rc.Close()
+			t.Errorf("Open(%q) succeeded, want an error", key)
+			continue
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("Open(%q): %v, want fs.ErrNotExist", key, err)
+		}
+	}
+	if got := readAll(t, s, "real.txt"); got != "inside" {
+		t.Errorf("content = %q, want inside", got)
+	}
+}
+
+func TestDir_DeleteRefusesDir(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := Dir(dir).Delete(context.Background(), "sub"); err == nil {
+		t.Error("Delete of a directory succeeded, want an error")
+	}
+	if _, err := os.Stat(sub); err != nil {
+		t.Errorf("directory is gone: %v", err)
+	}
+}
+
+func TestDir_DeleteMissingDir(t *testing.T) {
+	if err := Dir(filepath.Join(t.TempDir(), "never")).Delete(context.Background(), "a.txt"); err != nil {
+		t.Errorf("Delete in a missing directory: %v, want nil", err)
+	}
+}
+
+// M3b: the fallback creates the target, then its copy fails on a cancelled
+// ctx. The half-made target must be removed.
+func TestDir_FallbackCopyFailsRemovesTarget(t *testing.T) {
+	dir := t.TempDir()
+	s := Dir(dir).(*dirStore)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.link = func(oldname, newname string) error {
+		cancel()
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EPERM}
+	}
+	if _, err := s.Put(ctx, "m.txt", strings.NewReader("data")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Put: %v, want context.Canceled", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "m.txt")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("target left after a failed fallback copy: %v", err)
+	}
+	if got := leftovers(t, dir); len(got) != 0 {
+		t.Errorf("temp files left: %v", got)
+	}
+}
+
+// winnerReader creates the target on its first Read, after Put's existence
+// check has passed, so only the link can refuse the overwrite.
+type winnerReader struct {
+	t      *testing.T
+	target string
+	done   bool
+}
+
+func (r *winnerReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	if err := os.WriteFile(r.target, []byte("winner"), 0o600); err != nil {
+		r.t.Fatal(err)
+	}
+	return copy(p, "loser"), nil
+}
+
+// M2: a deterministic overwrite attempt.
+func TestDir_LinkRefusesLateWinner(t *testing.T) {
+	dir := t.TempDir()
+	s := Dir(dir)
+	target := filepath.Join(dir, "w.txt")
+	if _, err := s.Put(context.Background(), "w.txt", &winnerReader{t: t, target: target}); !errors.Is(err, ErrExists) {
+		t.Fatalf("Put: %v, want ErrExists", err)
+	}
+	if got := readAll(t, s, "w.txt"); got != "winner" {
+		t.Errorf("content = %q, want winner", got)
+	}
+	if got := leftovers(t, dir); len(got) != 0 {
+		t.Errorf("temp files left: %v", got)
+	}
+}
+
+type untouchableReader struct{ t *testing.T }
+
+func (r untouchableReader) Read([]byte) (int, error) {
+	r.t.Error("reader was read for a key that already exists")
+	return 0, io.EOF
+}
+
+// M1: an existing key is refused before the body is read at all.
+func TestDir_ExistingKeyNotRead(t *testing.T) {
+	ctx := context.Background()
+	s := Dir(t.TempDir())
+	if _, err := s.Put(ctx, "e.txt", strings.NewReader("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Put(ctx, "e.txt", untouchableReader{t}); !errors.Is(err, ErrExists) {
+		t.Fatalf("Put: %v, want ErrExists", err)
 	}
 }
