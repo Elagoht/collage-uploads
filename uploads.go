@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/Elagoht/collage/pkg/collage"
 )
@@ -29,8 +30,9 @@ const defaultDir = "var/uploads"
 // It is used only when the plugin was built without a store (New(nil) or
 // NewWith).
 type Config struct {
-	// Dir is the directory of the disk store. Empty means "var/uploads"; a
-	// section that sets it to "" explicitly is a startup error.
+	// Dir is the directory of the disk store, used when the plugin is built
+	// without a store; default "var/uploads". A section that sets it to ""
+	// explicitly is a startup error.
 	Dir string `json:"dir"`
 }
 
@@ -38,6 +40,8 @@ type Config struct {
 type Plugin struct {
 	store Store
 	cfg   Config
+	// log is the host's logger, which Handler reports store errors to.
+	log *slog.Logger
 }
 
 // New returns the plugin storing files in store. With a nil store, Init
@@ -56,8 +60,10 @@ func (p *Plugin) Version() string { return version }
 
 // Init keeps a store given to New. Otherwise it reads the configuration over
 // the directory NewWith was given ("var/uploads" when none was) and builds the
-// disk store there. A configuration that leaves no directory is an error.
+// disk store there. A configuration that leaves no directory is an error. In
+// both cases it keeps the host's logger for Handler.
 func (p *Plugin) Init(_ context.Context, host collage.Host) error {
+	p.log = host.Logger()
 	if p.store != nil {
 		return nil
 	}

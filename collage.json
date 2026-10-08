@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Elagoht/collage-snippets-highlighter/main/schemas/collage-plugin-manifest.schema.json",
+  "name": "elagoht/uploads",
+  "description": "Package uploads receives file uploads, validates them by their content, stores them under random keys, and serves them back safely.",
+  "repository": "https://github.com/Elagoht/collage-uploads",
+  "config": {
+    "type": "object",
+    "description": "Package uploads receives file uploads, validates them by their content, stores them under random keys, and serves them back safely.",
+    "properties": {
+      "dir": {
+        "type": "string",
+        "description": "directory of the disk store, used when the plugin is built without a store; default \"var/uploads\""
+      }
+    },
+    "additionalProperties": false
+  }
+}
