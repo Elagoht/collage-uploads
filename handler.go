@@ -145,7 +145,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			r = r.Clone(r.Context())
 			r.Header.Del("Range")
 		}
-		http.ServeContent(w, r, "", modtime, seeker)
+		http.ServeContent(w, r, "", modtime, &quietSeeker{ReadSeeker: seeker, h: h, r: r, key: key})
 		return
 	}
 
@@ -157,15 +157,43 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, io.MultiReader(bytes.NewReader(head), body))
 }
 
-// fail answers 500 without the store's error, and logs it unless the client
-// has already gone.
+// fail answers 500 without the store's error, and logs it.
 func (h *handler) fail(w http.ResponseWriter, r *http.Request, key string, err error) {
-	if r.Context().Err() == nil {
-		log := h.p.log
-		if log == nil {
-			log = slog.Default()
-		}
-		log.ErrorContext(r.Context(), "elagoht/uploads: serving a file failed", "key", key, "error", err)
-	}
+	h.logError(r, key, err)
 	http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+}
+
+// logError logs a failure serving key through the host's logger, unless the
+// client has already gone.
+func (h *handler) logError(r *http.Request, key string, err error) {
+	if r.Context().Err() != nil {
+		return
+	}
+	log := h.p.log
+	if log == nil {
+		log = slog.Default()
+	}
+	log.ErrorContext(r.Context(), "elagoht/uploads: serving a file failed", "key", key, "error", err)
+}
+
+// errSeek is what ServeContent sees when a seek fails. ServeContent writes a
+// failed range seek's error into the response body, and a store's error can
+// name a path on the server, so the real one is only logged.
+var errSeek = errors.New("elagoht/uploads: seek failed")
+
+// quietSeeker logs a failed seek and hands ServeContent errSeek instead.
+type quietSeeker struct {
+	io.ReadSeeker
+	h   *handler
+	r   *http.Request
+	key string
+}
+
+func (q *quietSeeker) Seek(offset int64, whence int) (int64, error) {
+	n, err := q.ReadSeeker.Seek(offset, whence)
+	if err != nil {
+		q.h.logError(q.r, q.key, err)
+		return n, errSeek
+	}
+	return n, nil
 }

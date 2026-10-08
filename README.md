@@ -69,7 +69,9 @@ collage.NewAction("upload").WithPath("en", "/upload").WithMethods(http.MethodPos
 
 A streaming action takes its CSRF token from the `X-CSRF-Token` header only, so a
 plain form cannot post to it. Send it with `fetch()`, reading the token from the
-input `{{csrfToken}}` renders (the cookie is `HttpOnly`):
+input `{{csrfToken}}` renders (the cookie is `HttpOnly`). `X-CSRF-Token` and
+`_csrf` are the defaults; `Security.CSRFHeaderName` and `Security.CSRFFieldName`
+rename them.
 
 ```js
 const token = form.querySelector('input[name="_csrf"]').value;
@@ -237,6 +239,17 @@ up in your database.
 request for several ranges is served whole, because a `multipart/byteranges`
 answer would replace the sniffed `Content-Type`. A store whose reader cannot seek
 is served whole, and `Range` is ignored.
+
+- **`Last-Modified` is the upload time.** `Dir`'s files carry their write time,
+  and ServeContent sends it, so anyone with a key learns when the file was
+  uploaded.
+- **A 416 carries no `Cache-Control`.** A range that cannot be satisfied is
+  answered by `net/http`, which drops `Cache-Control` from its error response;
+  `nosniff`, `sandbox` and `Content-Disposition` stay, and the body is a short
+  error, not the file.
+- **A failed seek is not shown.** If the store's reader fails to seek while a
+  range is served, the real error is logged with the key, and the client sees
+  only a generic one.
 
 The handler does no access control. Anyone with a key can fetch the file: 128
 random bits are hard to guess, but a key that leaks (in a log, in a `Referer`) is

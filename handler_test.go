@@ -506,3 +506,83 @@ func TestHandler_MountedInApp(t *testing.T) {
 		}
 	}
 }
+
+// flakySeeker reads fine, and its seeks fail after the first ok, with an error
+// naming a path the client must never see.
+type flakySeeker struct {
+	*bytes.Reader
+	ok, seeks int
+}
+
+func (f *flakySeeker) Seek(offset int64, whence int) (int64, error) {
+	f.seeks++
+	if f.seeks > f.ok {
+		return 0, errors.New("seek /srv/SECRET-PATH: boom")
+	}
+	return f.Reader.Seek(offset, whence)
+}
+
+func (*flakySeeker) Close() error { return nil }
+
+type flakySeekStore struct {
+	Store
+	data []byte
+	ok   int
+}
+
+func (s flakySeekStore) Open(context.Context, string) (io.ReadCloser, error) {
+	return &flakySeeker{Reader: bytes.NewReader(s.data), ok: s.ok}, nil
+}
+
+// A seek that fails inside ServeContent is logged, and its error never
+// reaches the client.
+func TestHandler_SeekErrorNotLeaked(t *testing.T) {
+	data := []byte(strings.Repeat("0123456789", 100))
+	// The handler's own seek to the start is the first; ServeContent then
+	// seeks to the end and back (2, 3), and to a range's start (4). ok 1
+	// fails the size probe (a 500); ok 3 fails the range seek (a 416).
+	for _, tc := range []struct {
+		name, rng string
+		ok        int
+	}{
+		{"plain", "", 1},
+		{"from 10", "bytes=10-", 1},
+		{"suffix", "bytes=-5", 1},
+		{"from 10 at range seek", "bytes=10-", 3},
+		{"suffix at range seek", "bytes=-5", 3},
+	} {
+		name, rng := tc.name, tc.rng
+		t.Run(name, func(t *testing.T) {
+			var logs bytes.Buffer
+			p := New(flakySeekStore{data: data, ok: tc.ok})
+			p.log = slog.New(slog.NewTextHandler(&logs, nil))
+			hdr := http.Header{}
+			if rng != "" {
+				hdr.Set("Range", rng)
+			}
+			w := get(p.Handler(), http.MethodGet, "/uploads/a.txt", hdr)
+			if w.Code < 400 {
+				t.Errorf("status = %d, want an error", w.Code)
+			}
+			if strings.Contains(w.Body.String(), "SECRET-PATH") || strings.Contains(w.Body.String(), "boom") {
+				t.Errorf("the seek error reached the client: %q", w.Body.String())
+			}
+			if !strings.Contains(logs.String(), "SECRET-PATH") || !strings.Contains(logs.String(), "a.txt") {
+				t.Errorf("the seek error was not logged with the key: %q", logs.String())
+			}
+		})
+	}
+}
+
+// A multi-range request for active content is served whole, still sandboxed,
+// nosniff and an attachment.
+func TestHandler_MultiRangeActiveContent(t *testing.T) {
+	for key, data := range map[string]string{"evil.png": svgXML, "note.txt": "plain text, long enough to range over"} {
+		w := get(putFile(t, key, []byte(data)).Handler(), http.MethodGet, "/uploads/"+key, http.Header{"Range": {"bytes=0-1,5-6"}})
+		if w.Code != http.StatusOK || w.Body.String() != data {
+			t.Errorf("%s: status %d, body %q, want 200 and the whole file", key, w.Code, w.Body.String())
+		}
+		wantAttachment(t, w, key)
+		wantSafe(t, w)
+	}
+}
