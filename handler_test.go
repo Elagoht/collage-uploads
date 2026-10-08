@@ -441,3 +441,68 @@ func TestHandler_NoStore(t *testing.T) {
 		t.Errorf("status = %d, want 500", w.Code)
 	}
 }
+
+// A multi-range request would be answered as multipart/byteranges, replacing
+// the sniffed Content-Type, so it is served whole instead.
+func TestHandler_MultiRangeServedWhole(t *testing.T) {
+	for _, tc := range []struct {
+		key  string
+		data []byte
+		ct   string
+	}{
+		{"p.png", pngBytes(t), "image/png"},
+		{"page.bin", []byte(htmlDoc), "text/html; charset=utf-8"},
+	} {
+		w := get(putFile(t, tc.key, tc.data).Handler(), http.MethodGet, "/uploads/"+tc.key, http.Header{"Range": {"bytes=0-1,5-6"}})
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200", tc.key, w.Code)
+		}
+		if got := w.Header().Get("Content-Type"); got != tc.ct {
+			t.Errorf("%s: Content-Type = %q, want %q", tc.key, got, tc.ct)
+		}
+		if !bytes.Equal(w.Body.Bytes(), tc.data) {
+			t.Errorf("%s: the body is not the whole file", tc.key)
+		}
+		wantSafe(t, w)
+	}
+}
+
+// The README's mounting example, end to end: headers through a real app.
+func TestHandler_MountedInApp(t *testing.T) {
+	store := Dir(t.TempDir())
+	ctx := context.Background()
+	if _, err := store.Put(ctx, "p.png", bytes.NewReader(pngBytes(t))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(ctx, "evil.png", strings.NewReader(svgXML)); err != nil {
+		t.Fatal(err)
+	}
+	p := New(store)
+	a, err := collage.New(&collage.Config{
+		Server:   collage.ServerConfig{Host: "localhost", Port: 3000},
+		Template: collage.TemplateConfig{FS: fstest.MapFS{"t/p.html": {Data: []byte(`<p>x</p>`)}}, Root: "t"},
+		Plugins:  []collage.Plugin{p},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Handle("/uploads/", p.Handler()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for key, wantInline := range map[string]bool{"p.png": true, "evil.png": false} {
+		r := httptest.NewRequest(http.MethodGet, "/uploads/"+key, nil)
+		r.Host = "localhost:3000"
+		w := httptest.NewRecorder()
+		a.Handler().ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d", key, w.Code)
+		}
+		wantSafe(t, w)
+		if inline := w.Header().Get("Content-Disposition") == ""; inline != wantInline {
+			t.Errorf("%s: inline = %v, want %v", key, inline, wantInline)
+		}
+	}
+}

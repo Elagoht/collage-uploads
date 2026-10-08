@@ -232,9 +232,11 @@ is the key, since the handler does not know the original name. To download under
 the original name, serve the file from an action of your own that looks the name
 up in your database.
 
-`Dir`'s files can seek, so `Range` and conditional requests (`If-Modified-Since`)
-work, through `http.ServeContent`, with the same headers. A store whose reader
-cannot seek is served whole, and `Range` is ignored.
+`Dir`'s files can seek, so a single `Range` and conditional requests
+(`If-Modified-Since`) work, through `http.ServeContent`, with the same headers. A
+request for several ranges is served whole, because a `multipart/byteranges`
+answer would replace the sniffed `Content-Type`. A store whose reader cannot seek
+is served whole, and `Range` is ignored.
 
 The handler does no access control. Anyone with a key can fetch the file: 128
 random bits are hard to guess, but a key that leaks (in a log, in a `Referer`) is

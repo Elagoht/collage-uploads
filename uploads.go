@@ -28,12 +28,9 @@ const defaultDir = "var/uploads"
 //	{"elagoht/uploads": {"dir": "var/uploads"}}
 //
 // It is used only when the plugin was built without a store (New(nil) or
-// NewWith).
+// NewWith). A section that sets "dir" to "" explicitly is a startup error.
 type Config struct {
-	// Dir is the directory of the disk store, used when the plugin is built
-	// without a store; default "var/uploads". A section that sets it to ""
-	// explicitly is a startup error.
-	Dir string `json:"dir"`
+	Dir string `json:"dir"` // directory of the disk store, used when the plugin is built without a store; default "var/uploads"
 }
 
 // Plugin is the uploads plugin.

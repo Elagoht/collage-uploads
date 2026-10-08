@@ -44,8 +44,10 @@ type HandlerOptions struct {
 //     are shown inline (SVG and HTML are always attachments);
 //   - Cache-Control: "private, max-age=0", or opts' CacheControl.
 //
-// When the store's reader can seek (Dir's can), Range and conditional
-// requests are answered by http.ServeContent, with those headers kept. A
+// When the store's reader can seek (Dir's can), a single Range and
+// conditional requests are answered by http.ServeContent, with those headers
+// kept. A request for several ranges is served whole, since a
+// multipart/byteranges answer would replace the sniffed Content-Type. A
 // reader that cannot seek is copied whole, and a Range is ignored.
 func (p *Plugin) Handler(opts ...HandlerOptions) http.Handler {
 	cacheControl := defaultCacheControl
@@ -137,7 +139,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// The Content-Type set above is kept: ServeContent sniffs only when
-		// there is none.
+		// there is none. It would replace it with multipart/byteranges for
+		// more than one range, so such a request is served whole.
+		if strings.Contains(r.Header.Get("Range"), ",") {
+			r = r.Clone(r.Context())
+			r.Header.Del("Range")
+		}
 		http.ServeContent(w, r, "", modtime, seeker)
 		return
 	}
