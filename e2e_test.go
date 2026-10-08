@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -93,16 +94,13 @@ func startE2E(t *testing.T, limit int64, maxFiles int, devMode bool) *e2eServer 
 	})
 	app, err := collage.New(&collage.Config{
 		DevMode: devMode,
-		Server: collage.ServerConfig{
-			Host: host, Port: port,
-			// A 100 MB body under the race detector is slower than the
-			// defaults allow for.
-			ReadTimeout: 5 * time.Minute, WriteTimeout: 5 * time.Minute,
-		},
+		// The server's default timeouts, as a deployment has them: the
+		// upload action raises its own with WithBodyTimeout.
+		Server:   collage.ServerConfig{Host: host, Port: port},
 		Security: collage.SecurityConfig{CSRFKey: bytes.Repeat([]byte("k"), 32)},
 		Template: collage.TemplateConfig{FS: fstest.MapFS{"t/p.html": {Data: []byte(`<p>x</p>`)}}, Root: "t"},
 		Plugins:  []collage.Plugin{u},
-		Logger:   slog.New(slog.NewTextHandler(s.logs, nil)),
+		Logger:   slog.New(slog.NewTextHandler(s.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -113,6 +111,9 @@ func startE2E(t *testing.T, limit int64, maxFiles int, devMode bool) *e2eServer 
 	}
 	action := collage.NewAction("upload").WithPath("en", "/upload").WithMethods(http.MethodPost).
 		WithStreamingBody().WithMaxBodyBytes(limit).
+		// A 100 MB body under the race detector takes longer than the
+		// server's 15s ReadTimeout and 30s WriteTimeout allow.
+		WithBodyTimeout(5 * time.Minute).
 		WithHandler(func(_ context.Context, rc *collage.RenderContext) (*collage.ActionResult, error) {
 			got, err := u.Receive(rc, Field("file", Rules{MaxSize: 150 << 20, MaxFiles: maxFiles}))
 			s.received <- err
@@ -449,6 +450,21 @@ func TestE2E_DisconnectLeavesNothing(t *testing.T) {
 	}
 	if got := storeEntries(t, s.store); len(got) != 0 {
 		t.Errorf("the store holds %v after a disconnect, want nothing", got)
+	}
+	// A cancelled upload is the client's doing: logged at debug, never as
+	// the application's error.
+	logged := false
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if strings.Contains(s.logs.String(), `level=DEBUG msg="collage: request failed"`) {
+			logged = true
+			break
+		}
+	}
+	if !logged {
+		t.Error("the disconnect was not logged at debug")
+	}
+	if strings.Contains(s.logs.String(), "level=ERROR") {
+		t.Error("the disconnect was logged at ERROR")
 	}
 }
 

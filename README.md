@@ -63,9 +63,12 @@ upload := func(_ context.Context, rc *collage.RenderContext) (*collage.ActionRes
 ```go
 collage.NewAction("upload").WithPath("en", "/upload").WithMethods(http.MethodPost).
 	WithStreamingBody().
-	WithMaxBodyBytes(2 << 30). // the 4 MiB default bounds a stream too
+	WithMaxBodyBytes(2 << 30).        // the 4 MiB default bounds a stream too
+	WithBodyTimeout(5 * time.Minute). // the server's 15s/30s deadlines end a long upload
 	WithHandler(upload)
 ```
+
+See [Timeouts](#timeouts) for choosing the timeout.
 
 A streaming action takes its CSRF token from the `X-CSRF-Token` header only, so a
 plain form cannot post to it. Send it with `fetch()`, reading the token from the
@@ -82,9 +85,13 @@ await fetch(form.action, {
 });
 ```
 
-Anything that parses the form on a streaming action, such as `FormValue` or
-`validate.Form`, consumes the stream, and `Receive` then finds nothing. Read the
-non-file fields from `Received.Values` instead.
+Anything that parses the form on a streaming action before `Receive`, such as
+`FormValue`, `ParseMultipartForm` or `validate.Form`, gives up the stream without
+an error. `Receive` still succeeds, through the parsed path, but by then net/http
+has written the whole body, up to `MaxBodyBytes`, to temp files under
+`os.TempDir()` — on many Linux hosts a `tmpfs`, and so memory. The other order
+fails instead: after `Receive` has streamed the body, `validate.Form` finds an
+empty form. Read and check the non-file fields from `Received.Values`.
 
 ## Rules
 
@@ -125,8 +132,11 @@ values, then undeclared fields, then files field by field in name order.
 
 Other errors come back with a nil `Received`:
 
-- a second `Receive` in one render, or one after the application took the body
-  itself, is `ErrAlreadyRead`;
+- a second `Receive` in one render, or one after the application called
+  `rc.Request.MultipartReader()` itself, is `ErrAlreadyRead`. After the
+  application parsed the form (`ParseMultipartForm`, `FormValue`), `Receive`
+  succeeds through the parsed path, as above; after it read the body some other
+  way (`io.ReadAll`), the stream path fails with the multipart reader's error;
 - a body over the action's `MaxBodyBytes` wraps `*http.MaxBytesError`, which
   collage answers with 413;
 - a client that went away, or a store that failed, is returned as it came.
@@ -140,6 +150,14 @@ ends mid-file leaves no file in the store and no temp file on disk.
 
 Once `Receive` succeeds, the files are yours. If the action fails after that, as
 in a database write, delete them with `u.Store().Delete`.
+
+A crash, or a shutdown that times out, between `Receive` and your database write
+leaves files in the store that no row points to. They are harmless, since nobody
+holds their keys, but they take space. Sweep for them now and then: list the
+store's directory (the `Store` interface has no listing; `Dir` is a plain
+directory), and delete each key older than an hour or so that your database does
+not know. Skip `.upload-*` temp files younger than that, which may be uploads in
+progress.
 
 ## Keys and names
 
@@ -273,6 +291,76 @@ who is asking and then calls `u.Store().Open`, setting the same headers.
 - **Names are display text.** Escape `Name` like any other user input when you
   show it; templates do this for you.
 
+## Timeouts
+
+The server's deadlines are sized for pages: `ReadTimeout` (15s by default) bounds
+reading the whole request, and `WriteTimeout` (30s) starts when the headers
+arrive, so it bounds the upload as well as the answer. A streaming upload slower
+than that fails. Raising only `ReadTimeout` is worse: an upload that outlives
+`WriteTimeout` is received and stored, the client never gets the answer, and it
+tries again.
+
+Give the upload action its own deadline with `WithBodyTimeout(d)` (collage
+v0.57.0) rather than raising the server's. Both deadlines become now plus `d` for
+that action alone, once its page's guards have let the request through. Choose
+`d` to cover the whole upload and the answer: at least `MaxBodyBytes` divided by
+the slowest connection you serve. A client that goes away mid-upload, or runs out
+of time, is answered `400` or `408`, `Receive` deletes what it stored, and collage
+logs it at debug rather than as a server error.
+
+## Behind a proxy
+
+- **nginx** refuses anything over `client_max_body_size` (1 MiB by default) with
+  its own 413, and by default buffers the whole body to its own disk before
+  passing it on, which loses the stream and fills nginx's temp directory instead.
+  For the upload location:
+
+  ```nginx
+  location /upload {
+      client_max_body_size     2g;
+      proxy_request_buffering  off;
+      proxy_send_timeout       30m;
+      proxy_read_timeout       30m;
+      proxy_pass               http://127.0.0.1:8080;
+  }
+  ```
+
+- **Caddy** streams request bodies; `request_body { max_size 2GB }` sets its
+  limit.
+- **Cloudflare** caps request bodies by plan (100 MB on Free and Pro when this was
+  written; check Cloudflare's documentation for yours), and other CDNs and load
+  balancers have caps and idle timeouts of their own. Larger files need a
+  hostname that bypasses the CDN.
+
+collage's "Going to production" guide has the same notes under "Uploads".
+
+## Abuse and disk
+
+An upload action takes bytes from the network and keeps them on your disk, so it
+is the first thing an abuser looks for.
+
+- **Guard the action.** The example above has no guard. A CSRF token is not
+  authentication: anyone who loads the form page gets one. Put the upload action
+  on a page behind a session or auth guard, so an anonymous client cannot store
+  anything.
+- **Quotas are the application's.** The plugin has no notion of a user. Check
+  each user's total in the handler before calling `Receive`, from your database;
+  `rc.Request.ContentLength`, when the client sends it, is an upper bound to check
+  first.
+- **Keep the limits tight.** `MaxBodyBytes` and each field's `MaxSize` are what one
+  request can cost you. Set them to the largest file you mean to accept, not to
+  what the disk could take.
+- **Rate-limit the path.** `elagoht/ratelimit` on the upload action bounds how
+  often one client can try.
+- **Watch the disk.** `Dir` has no total cap. Keep it on a filesystem or volume
+  of its own, so a full store does not stop the rest of the system, and monitor
+  it.
+- **Long uploads hold slots.** `elagoht/health`'s `maxInFlight` counts an upload
+  for as long as it lasts. Size it for the uploads you expect at once, or slow
+  uploads will push the rest of the site into 503s.
+- **Never serve the directory directly** with nginx or a static file handler:
+  that drops the headers `u.Handler()` sets.
+
 ## Limits
 
 - Non-file values: 64 KiB in total, counting each name and 200 bytes per part.
@@ -290,4 +378,4 @@ who is asking and then calls `u.Store().Open`, setting the same headers.
 - Image processing (see opti-image).
 - Virus scanning.
 - Client-side progress UI.
-- Quotas and per-user limits.
+- Quotas and per-user limits (see [Abuse and disk](#abuse-and-disk)).
