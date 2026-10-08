@@ -23,7 +23,6 @@ import (
 	"testing"
 	"testing/fstest"
 	"testing/iotest"
-	"time"
 
 	"github.com/Elagoht/collage/pkg/collage"
 )
@@ -99,7 +98,10 @@ func app(t *testing.T, p *Plugin, parsed bool, pluginConfig map[string]json.RawM
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := collage.NewAction("upload").WithPath("en", "/upload").WithMethods(http.MethodPost).WithoutCSRF()
+	// A limit above the largest body a test sends, so the parsed path can
+	// parse every one of them.
+	b := collage.NewAction("upload").WithPath("en", "/upload").WithMethods(http.MethodPost).WithoutCSRF().
+		WithMaxBodyBytes(64 << 20)
 	if !parsed {
 		b = b.WithStreamingBody()
 	}
@@ -285,6 +287,25 @@ func TestReceive_SniffTraps(t *testing.T) {
 					t.Errorf("Key = %q, want .bin or .txt, never .png", f.Key)
 				}
 			})
+			// A PNG signature followed by HTML sniffs as image/png, and is
+			// accepted by an image rule: sniffing reads the leading bytes and
+			// nothing more. It is pinned so the behaviour is a decision, not a
+			// surprise. What makes it harmless is how Task 4's Handler serves
+			// it: Content-Type image/png with nosniff and a sandbox CSP, so no
+			// browser renders the HTML inside.
+			t.Run("png signature polyglot is typed image/png", func(t *testing.T) {
+				polyglot := []byte("\x89PNG\r\n\x1a\n<html><script>alert(1)</script></html>")
+				p, _ := newDirPlugin(t)
+				body, ct := multipartBody(t, lying(polyglot))
+				got, err := receive(t, p, path.parsed, bytes.NewReader(body), ct,
+					Field("pic", Rules{Types: []string{"image/png"}}))
+				if err != nil {
+					t.Fatalf("Receive: %v", err)
+				}
+				if f := got.Files["pic"][0]; f.Type != "image/png" || !strings.HasSuffix(f.Key, ".png") {
+					t.Errorf("Type = %q, Key = %q, want image/png and .png", f.Type, f.Key)
+				}
+			})
 			for name, svg := range svgs {
 				t.Run("svg "+name, func(t *testing.T) {
 					p, _ := newDirPlugin(t)
@@ -452,11 +473,13 @@ func TestReceive_Values(t *testing.T) {
 					t.Errorf("got %d files, want 1", len(got.Files["f"]))
 				}
 			})
+			// Each value part costs its name, its value and valuePartOverhead
+			// bytes: here 1 + 32567 + 200 = 32 KiB, twice.
 			t.Run("exactly 64 KiB passes", func(t *testing.T) {
 				p, _ := newDirPlugin(t)
 				body, ct := multipartBody(t,
-					value("a", strings.Repeat("x", 32<<10)),
-					value("b", strings.Repeat("y", 32<<10)))
+					value("a", strings.Repeat("x", 32<<10-201)),
+					value("b", strings.Repeat("y", 32<<10-201)))
 				if _, err := receive(t, p, path.parsed, bytes.NewReader(body), ct); err != nil {
 					t.Fatalf("Receive: %v", err)
 				}
@@ -465,8 +488,8 @@ func TestReceive_Values(t *testing.T) {
 				p, dir := newDirPlugin(t)
 				body, ct := multipartBody(t,
 					file("f", "a.txt", []byte("stored first")),
-					value("a", strings.Repeat("x", 32<<10)),
-					value("b", strings.Repeat("y", 32<<10+1)))
+					value("a", strings.Repeat("x", 32<<10-201)),
+					value("b", strings.Repeat("y", 32<<10-201+1)))
 				_, err := receive(t, p, path.parsed, bytes.NewReader(body), ct, Field("f", Rules{}))
 				wantRule(t, err, "b", ErrTooLarge)
 				if names := stored(t, dir); len(names) != 0 {
@@ -773,48 +796,38 @@ func TestSniff(t *testing.T) {
 	}
 }
 
-// A request whose context ended mid-handler (a reset stream, a deadline) loses
-// its marker; a Receive after that must still not read the body again, nor take
-// the sentinel MultipartReader left behind for a parsed form.
+// A second Receive after the request's context ended mid-handler (a reset
+// stream, a deadline) is still refused: the marker belongs to the render, not
+// to the context.
 func TestReceive_AlreadyReadAfterCancel(t *testing.T) {
-	p, _ := newDirPlugin(t)
-	body, ct := multipartBody(t, file("f", "a.txt", []byte("once")))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var second error
-	var secondGot *Received
-	h, err := app(t, p, false, nil, func(rc *collage.RenderContext) {
-		if _, err := p.Receive(rc, Field("f", Rules{})); err != nil {
-			t.Errorf("first Receive: %v", err)
-		}
-		cancel()
-		if rc.Request.Context().Err() == nil {
-			t.Fatal("the handler's request does not derive its context from the test's")
-		}
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			consumed.mu.Lock()
-			_, marked := consumed.m[rc.Request]
-			consumed.mu.Unlock()
-			if !marked {
-				break
+	for _, path := range paths {
+		t.Run(path.name, func(t *testing.T) {
+			p, _ := newDirPlugin(t)
+			body, ct := multipartBody(t, file("f", "a.txt", []byte("once")))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var second error
+			h, err := app(t, p, path.parsed, nil, func(rc *collage.RenderContext) {
+				if _, err := p.Receive(rc, Field("f", Rules{})); err != nil {
+					t.Errorf("first Receive: %v", err)
+				}
+				cancel()
+				if rc.Request.Context().Err() == nil {
+					t.Error("the handler's request does not derive its context from the test's")
+				}
+				_, second = p.Receive(rc, Field("f", Rules{}))
+			})
+			if err != nil {
+				t.Fatal(err)
 			}
-			if time.Now().After(deadline) {
-				t.Fatal("the marker outlived the request's context")
+			r := httptest.NewRequest(http.MethodPost, "/upload", bytes.NewReader(body)).WithContext(ctx)
+			r.Host = "localhost:3000"
+			r.Header.Set("Content-Type", ct)
+			h.ServeHTTP(httptest.NewRecorder(), r)
+			if !errors.Is(second, ErrAlreadyRead) {
+				t.Errorf("second Receive after the context ended: %v, want ErrAlreadyRead", second)
 			}
-			time.Sleep(time.Millisecond)
-		}
-		secondGot, second = p.Receive(rc, Field("f", Rules{}))
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := httptest.NewRequest(http.MethodPost, "/upload", bytes.NewReader(body)).WithContext(ctx)
-	r.Host = "localhost:3000"
-	r.Header.Set("Content-Type", ct)
-	h.ServeHTTP(httptest.NewRecorder(), r)
-	if second == nil {
-		t.Errorf("second Receive after the context ended succeeded: %+v", secondGot)
+		})
 	}
 }
 
@@ -836,4 +849,364 @@ func TestReceive_NotMultipartLeavesForm(t *testing.T) {
 	if a != "1" {
 		t.Errorf("FormValue after Receive = %q, want 1", a)
 	}
+}
+
+// spyStore wraps a store and counts its Puts. With panicAt set, the Put of
+// that number panics; tests run on one goroutine, so plain fields do.
+type spyStore struct {
+	Store
+	puts    int
+	panicAt int
+}
+
+func (s *spyStore) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
+	s.puts++
+	if s.puts == s.panicAt {
+		panic("store exploded")
+	}
+	return s.Store.Put(ctx, key, r)
+}
+
+func newSpyPlugin(t *testing.T) (*Plugin, *spyStore, string) {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "uploads")
+	s := &spyStore{Store: Dir(dir)}
+	return New(s), s, dir
+}
+
+// valueParts is a multipart body of n empty values, each named by i padded to
+// width digits.
+func valueParts(t *testing.T, n, width int) ([]byte, string) {
+	t.Helper()
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	for i := range n {
+		if _, err := w.CreateFormField(fmt.Sprintf("%0*d", width, i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return body.Bytes(), w.FormDataContentType()
+}
+
+// The values budget charges each part its name and a fixed overhead, so it
+// cannot be spent in names or in the number of parts.
+func TestReceive_ValuesCapCountsNamesAndParts(t *testing.T) {
+	for _, path := range paths {
+		t.Run(path.name, func(t *testing.T) {
+			t.Run("huge names", func(t *testing.T) {
+				p, _ := newDirPlugin(t)
+				body, ct := valueParts(t, 50, 200<<10)
+				got, err := receive(t, p, path.parsed, bytes.NewReader(body), ct)
+				if !errors.Is(err, ErrTooLarge) {
+					t.Fatalf("err = %v, want ErrTooLarge", err)
+				}
+				if got != nil && len(got.Values) != 0 {
+					t.Errorf("held %d values with 200 KiB names", len(got.Values))
+				}
+			})
+			t.Run("many tiny fields", func(t *testing.T) {
+				p, _ := newDirPlugin(t)
+				body, ct := valueParts(t, 400, 8)
+				if _, err := receive(t, p, path.parsed, bytes.NewReader(body), ct); !errors.Is(err, ErrTooLarge) {
+					t.Fatalf("err = %v, want ErrTooLarge", err)
+				}
+			})
+		})
+	}
+	// More parts than ParseMultipartForm accepts, so the stream path alone.
+	t.Run("stream/200000 tiny fields", func(t *testing.T) {
+		p, _ := newDirPlugin(t)
+		body, ct := valueParts(t, 200000, 8)
+		got, err := receive(t, p, false, bytes.NewReader(body), ct)
+		if !errors.Is(err, ErrTooLarge) {
+			t.Fatalf("err = %v, want ErrTooLarge", err)
+		}
+		if got != nil && len(got.Values) > 400 {
+			t.Errorf("held %d values", len(got.Values))
+		}
+	})
+}
+
+// The stream path counts every part, those it skips included, and stops at
+// the same 1000 that ParseMultipartForm allows.
+func TestReceive_PartLimit(t *testing.T) {
+	build := func(n int) ([]byte, string) {
+		var body bytes.Buffer
+		w := multipart.NewWriter(&body)
+		for range n {
+			h := textproto.MIMEHeader{}
+			h.Set("Content-Type", "text/plain")
+			if _, err := w.CreatePart(h); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return body.Bytes(), w.FormDataContentType()
+	}
+	p, _ := newDirPlugin(t)
+	body, ct := build(maxParts)
+	if _, err := receive(t, p, false, bytes.NewReader(body), ct); err != nil {
+		t.Fatalf("%d parts: %v", maxParts, err)
+	}
+	body, ct = build(maxParts + 1)
+	if _, err := receive(t, p, false, bytes.NewReader(body), ct); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("%d parts: err = %v, want ErrTooLarge", maxParts+1, err)
+	}
+}
+
+// countingReader counts the bytes read through it.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// A refused file is not read to its end: Receive returns as soon as it knows.
+func TestReceive_RefusalStopsReading(t *testing.T) {
+	const slack = 64 << 10
+	big := bytes.Repeat([]byte("a"), 10<<20)
+	for _, tc := range []struct {
+		name  string
+		rules Rules
+		rule  error
+		limit int64
+	}{
+		{"over MaxSize", Rules{MaxSize: 1 << 10}, ErrTooLarge, 1<<10 + slack},
+		{"refused type", Rules{Types: []string{"image/png"}}, ErrType, sniffLen + slack},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, dir := newDirPlugin(t)
+			body, ct := multipartBody(t, file("f", "a.txt", big))
+			cr := &countingReader{r: bytes.NewReader(body)}
+			var err error
+			var readAtReturn int64
+			h, startErr := app(t, p, false, nil, func(rc *collage.RenderContext) {
+				_, err = p.Receive(rc, Field("f", tc.rules))
+				readAtReturn = cr.n
+			})
+			if startErr != nil {
+				t.Fatal(startErr)
+			}
+			post(h, cr, ct)
+			wantRule(t, err, "f", tc.rule)
+			if readAtReturn > tc.limit {
+				t.Errorf("Receive read %d bytes of the body before returning, want at most %d", readAtReturn, tc.limit)
+			}
+			if names := stored(t, dir); len(names) != 0 {
+				t.Errorf("store holds %v", names)
+			}
+		})
+	}
+}
+
+// A store that panics still leaves nothing behind, and the panic goes on.
+func TestReceive_StorePanicLeavesNothing(t *testing.T) {
+	for _, path := range paths {
+		t.Run(path.name, func(t *testing.T) {
+			p, s, dir := newSpyPlugin(t)
+			s.panicAt = 2
+			body, ct := multipartBody(t, file("f", "1.txt", []byte("one")), file("f", "2.txt", []byte("two")))
+			var panicked bool
+			h, err := app(t, p, path.parsed, nil, func(rc *collage.RenderContext) {
+				defer func() {
+					panicked = recover() != nil
+				}()
+				_, _ = p.Receive(rc, Field("f", Rules{MaxFiles: 2}))
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			post(h, bytes.NewReader(body), ct)
+			if !panicked {
+				t.Error("the store's panic did not propagate out of Receive")
+			}
+			if s.puts != 2 {
+				t.Fatalf("Puts = %d, want 2", s.puts)
+			}
+			if names := stored(t, dir); len(names) != 0 {
+				t.Errorf("store holds %v after a panic", names)
+			}
+		})
+	}
+}
+
+// untrustedStore misbehaves in one of the ways a careless remote store might,
+// over a real Dir underneath.
+type untrustedStore struct {
+	Store
+	mode string // "swallow", "lie" or "quit"
+}
+
+func (s *untrustedStore) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
+	switch s.mode {
+	case "swallow": // ignores the reader's error
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		return s.Store.Put(ctx, key, &buf)
+	case "lie": // reports a size it did not store
+		n, err := s.Store.Put(ctx, key, r)
+		return n + 1, err
+	case "quit": // stops reading early and reports success
+		return s.Store.Put(ctx, key, io.LimitReader(r, 10))
+	}
+	panic("unknown mode " + s.mode)
+}
+
+// Receive checks what a successful Put says against what it read, and
+// deletes the file when they disagree.
+func TestReceive_DistrustsStore(t *testing.T) {
+	for _, path := range paths {
+		t.Run(path.name, func(t *testing.T) {
+			for _, mode := range []string{"swallow", "lie", "quit"} {
+				t.Run(mode, func(t *testing.T) {
+					dir := filepath.Join(t.TempDir(), "uploads")
+					p := New(&untrustedStore{Store: Dir(dir), mode: mode})
+					// Over MaxSize for the store that swallows the refusal;
+					// within it for the others, whose lies are about the rest.
+					size := 50
+					if mode == "swallow" {
+						size = 101
+					}
+					body, ct := multipartBody(t, file("f", "a.txt", bytes.Repeat([]byte("a"), size)))
+					got, err := receive(t, p, path.parsed, bytes.NewReader(body), ct, Field("f", Rules{MaxSize: 100}))
+					if err == nil {
+						t.Fatalf("Receive succeeded over a %s store: %+v", mode, got.Files)
+					}
+					if mode == "swallow" {
+						wantRule(t, err, "f", ErrTooLarge)
+					}
+					if names := stored(t, dir); len(names) != 0 {
+						t.Errorf("store holds %v", names)
+					}
+				})
+			}
+		})
+	}
+	t.Run("stream/swallowed read error", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "uploads")
+		p := New(&untrustedStore{Store: Dir(dir), mode: "swallow"})
+		data := bytes.Repeat([]byte("a"), 4000)
+		body, ct := multipartBody(t, file("f", "a.txt", data))
+		cut := bytes.Index(body, data) + 2000
+		_, err := receive(t, p, false, &failingBody{data: body[:cut], err: io.ErrUnexpectedEOF}, ct, Field("f", Rules{}))
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("err = %v, want io.ErrUnexpectedEOF", err)
+		}
+		if names := stored(t, dir); len(names) != 0 {
+			t.Errorf("store holds %v", names)
+		}
+	})
+}
+
+// Every refusal that can be decided before a file is stored is.
+func TestReceive_RefusesBeforePut(t *testing.T) {
+	png := pngBytes(t)
+	for _, path := range paths {
+		t.Run(path.name, func(t *testing.T) {
+			t.Run("refused type", func(t *testing.T) {
+				p, s, _ := newSpyPlugin(t)
+				body, ct := multipartBody(t, file("f", "a.png", []byte("<html></html>")))
+				_, err := receive(t, p, path.parsed, bytes.NewReader(body), ct, Field("f", Rules{Types: []string{"image/png"}}))
+				wantRule(t, err, "f", ErrType)
+				if s.puts != 0 {
+					t.Errorf("Puts = %d, want 0", s.puts)
+				}
+			})
+			t.Run("undeclared field first", func(t *testing.T) {
+				p, s, _ := newSpyPlugin(t)
+				body, ct := multipartBody(t, file("other", "o.png", png), file("f", "a.png", png))
+				_, err := receive(t, p, path.parsed, bytes.NewReader(body), ct, Field("f", Rules{}))
+				wantRule(t, err, "other", ErrUnexpectedField)
+				if s.puts != 0 {
+					t.Errorf("Puts = %d, want 0", s.puts)
+				}
+			})
+			t.Run("too many", func(t *testing.T) {
+				p, s, dir := newSpyPlugin(t)
+				body, ct := multipartBody(t,
+					file("f", "1.png", png), file("f", "2.png", png), file("f", "3.png", png))
+				_, err := receive(t, p, path.parsed, bytes.NewReader(body), ct, Field("f", Rules{MaxFiles: 2}))
+				wantRule(t, err, "f", ErrTooMany)
+				if s.puts != 2 {
+					t.Errorf("Puts = %d, want exactly MaxFiles (2)", s.puts)
+				}
+				if names := stored(t, dir); len(names) != 0 {
+					t.Errorf("store holds %v", names)
+				}
+			})
+		})
+	}
+	// The parsed path sees every field up front, so an undeclared one is
+	// refused even when a declared file comes first.
+	t.Run("parsed/undeclared field after a declared one", func(t *testing.T) {
+		p, s, _ := newSpyPlugin(t)
+		body, ct := multipartBody(t, file("f", "a.png", png), file("other", "o.png", png))
+		_, err := receive(t, p, true, bytes.NewReader(body), ct, Field("f", Rules{}))
+		wantRule(t, err, "other", ErrUnexpectedField)
+		if s.puts != 0 {
+			t.Errorf("Puts = %d, want 0", s.puts)
+		}
+	})
+}
+
+// An application that took the body with MultipartReader itself has read it.
+func TestReceive_AfterAppMultipartReader(t *testing.T) {
+	p, _ := newDirPlugin(t)
+	body, ct := multipartBody(t, file("f", "a.txt", []byte("hello")))
+	var err error
+	h, startErr := app(t, p, false, nil, func(rc *collage.RenderContext) {
+		if _, merr := rc.Request.MultipartReader(); merr != nil {
+			t.Errorf("MultipartReader: %v", merr)
+		}
+		_, err = p.Receive(rc, Field("f", Rules{}))
+	})
+	if startErr != nil {
+		t.Fatal(startErr)
+	}
+	post(h, bytes.NewReader(body), ct)
+	if !errors.Is(err, ErrAlreadyRead) {
+		t.Errorf("err = %v, want ErrAlreadyRead", err)
+	}
+}
+
+// A broken rule comes back with the values read so far, for re-showing the
+// form; any other error comes back alone.
+func TestReceive_ValuesOnRuleError(t *testing.T) {
+	for _, path := range paths {
+		t.Run(path.name, func(t *testing.T) {
+			p, _ := newDirPlugin(t)
+			body, ct := multipartBody(t,
+				value("title", "Hello"),
+				file("f", "a.png", []byte("<html></html>")))
+			got, err := receive(t, p, path.parsed, bytes.NewReader(body), ct, Field("f", Rules{Types: []string{"image/png"}}))
+			wantRule(t, err, "f", ErrType)
+			if got == nil {
+				t.Fatal("no Received with a rule error")
+			}
+			if got.Values.Get("title") != "Hello" {
+				t.Errorf("Values = %v, want title", got.Values)
+			}
+			if got.Files == nil || len(got.Files) != 0 {
+				t.Errorf("Files = %v, want empty and non-nil", got.Files)
+			}
+		})
+	}
+	t.Run("stream/not a rule", func(t *testing.T) {
+		p, _ := newDirPlugin(t)
+		body, ct := multipartBody(t, value("title", "Hello"), file("f", "a.txt", bytes.Repeat([]byte("a"), 4000)))
+		got, err := receive(t, p, false, &failingBody{data: body[:len(body)-1000], err: io.ErrUnexpectedEOF}, ct, Field("f", Rules{}))
+		if err == nil || got != nil {
+			t.Errorf("got %+v, %v; want nil and an error", got, err)
+		}
+	})
 }

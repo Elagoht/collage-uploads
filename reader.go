@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"net/http"
@@ -55,12 +56,17 @@ func mediaType(contentType string) string {
 // errFileTooLarge once more than max bytes have passed (max <= 0 is no limit).
 // It never asks the source for more than max+1 bytes in all, so a file over its
 // limit is not read further than that.
+//
+// It also records how the read ended, so verify can check a store that
+// reported success: a store may ignore the reader's error or stop early.
 type fileReader struct {
 	src      io.Reader
 	max      int64
 	n        int64
 	hash     hash.Hash
 	tooLarge bool
+	eof      bool  // the source reached its end
+	err      error // the first read error other than io.EOF
 }
 
 func newFileReader(head []byte, rest io.Reader, max int64) *fileReader {
@@ -85,7 +91,29 @@ func (f *fileReader) Read(p []byte) (int, error) {
 		f.tooLarge = true
 		return n, errFileTooLarge
 	}
+	switch {
+	case err == io.EOF:
+		f.eof = true
+	case err != nil && f.err == nil:
+		f.err = err
+	}
 	return n, err
+}
+
+// verify checks a Put that reported n bytes stored against what was read: the
+// file within its limit, read without error to its end, and n all of it.
+func (f *fileReader) verify(n int64) error {
+	switch {
+	case f.tooLarge:
+		return errFileTooLarge
+	case f.err != nil:
+		return f.err
+	case !f.eof:
+		return errors.New("elagoht/uploads: the store stopped reading before the end of the file")
+	case n != f.n:
+		return fmt.Errorf("elagoht/uploads: the store reported %d bytes stored of %d read", n, f.n)
+	}
+	return nil
 }
 
 // sum is the hex SHA-256 of what has been read.

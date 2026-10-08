@@ -10,14 +10,23 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/Elagoht/collage/pkg/collage"
 )
 
-// maxValueBytes caps the non-file values of one submission, in total.
+// maxValueBytes caps the non-file values of one submission, in total, names
+// and per-part overhead included.
 const maxValueBytes = 64 << 10
+
+// valuePartOverhead is what each value part costs beyond its name and value,
+// as multipart.Reader.ReadForm charges it: without it, a flood of empty
+// values would cost nothing.
+const valuePartOverhead = 200
+
+// maxParts is how many parts the stream path reads, every part counted, as
+// ParseMultipartForm's default allows.
+const maxParts = 1000
 
 // cleanupTimeout bounds deleting what a failed Receive had stored.
 const cleanupTimeout = 5 * time.Second
@@ -67,43 +76,12 @@ type Received struct {
 	Values url.Values
 }
 
-// consumed holds the requests a Receive has started on. A request's body can
-// be read once, so the marker belongs to the request, not to the render or to
-// one Plugin. Checking and setting it under one mutex makes two concurrent
-// Receives on one request race-free: exactly one wins. The marker is set
-// before anything is read and stays when Receive returns, failed or not, so a
-// later Receive sees it. It is removed when the request's context ends, which
-// for a served request is when its handler returns, but can be sooner: a reset
-// stream or a deadline ends it mid-handler. So Receive checks the context right
-// after marking: the marker is deleted only once the context is done, so a call
-// that finds no marker after that sees a non-nil Err and stops there, rather
-// than reading the body again or mistaking the sentinel MultipartReader leaves
-// in MultipartForm for a parsed form.
-//
-// A plain map under a mutex rather than a sync.Map, whose API is any-typed;
-// and not a collage Key on the RenderContext, whose Get then Set is not
-// atomic.
-var consumed = struct {
-	mu sync.Mutex
-	m  map[*http.Request]struct{}
-}{m: map[*http.Request]struct{}{}}
-
-// markRead records that r's body is being read, and reports whether it was
-// the first to.
-func markRead(r *http.Request) bool {
-	consumed.mu.Lock()
-	defer consumed.mu.Unlock()
-	if _, ok := consumed.m[r]; ok {
-		return false
-	}
-	consumed.m[r] = struct{}{}
-	context.AfterFunc(r.Context(), func() {
-		consumed.mu.Lock()
-		delete(consumed.m, r)
-		consumed.mu.Unlock()
-	})
-	return true
-}
+// readKey marks a render whose request body a Receive has taken. collage.Once
+// runs the first caller's function and hands every later caller its result
+// without running theirs, atomically, so whichever Receive's function ran is
+// the one that reads. The mark lives exactly as long as the render: nothing
+// to clean up, and it does not care whether the request's context has ended.
+var readKey = collage.NewKey[bool]("elagoht/uploads:read")
 
 // Receive reads the submission's files and values, checks each file against
 // its field's rules, and stores the files. It reads the form the application
@@ -113,17 +91,31 @@ func markRead(r *http.Request) bool {
 //
 // A file's type is sniffed from its first 512 bytes; the client's name and
 // Content-Type are never consulted. Non-file values go to Values, at most
-// 64 KiB in total.
+// 64 KiB in total, counting each value's name and 200 bytes per part. The
+// stream path reads at most 1000 parts.
 //
 // It is all or nothing: on any error, whether a broken rule, a read that
-// failed (a client gone, a body cut off) or a body over the action's limit,
-// every file this call stored is deleted before the error is returned. A
+// failed (a client gone, a body cut off), a body over the action's limit, a
+// store that misreports what it stored, or a panic out of the store, every
+// file this call stored is deleted before the error (or panic) goes on. A
 // broken rule is an *Error; a body over its limit wraps *http.MaxBytesError,
 // which collage answers with 413. A non-multipart request has no files, and
 // its Values are its parsed PostForm, if any.
 //
-// A request's body is read once: a second Receive on it returns
-// ErrAlreadyRead, even when the first failed.
+// With an *Error, Receive also returns a Received holding no files and the
+// values read so far, for re-showing the form. On the stream path that is
+// only the values that came before the failing part. Any other error comes
+// back with a nil Received.
+//
+// When several parts break rules, which one is reported can differ between
+// the paths: the stream path reports the first in the body, the parsed path
+// checks values, then undeclared fields, then files field by field in name
+// order.
+//
+// A request's body is read once: a second Receive in the same render returns
+// ErrAlreadyRead, even when the first failed, and so does a Receive after the
+// application took the body with MultipartReader itself. The mark is kept on
+// the RenderContext collage built; a hand-built one has nowhere to keep it.
 func (p *Plugin) Receive(rc *collage.RenderContext, fields ...FieldSpec) (*Received, error) {
 	if p.store == nil {
 		return nil, errors.New("elagoht/uploads: no store: register the plugin, or pass a store to New")
@@ -131,14 +123,19 @@ func (p *Plugin) Receive(rc *collage.RenderContext, fields ...FieldSpec) (*Recei
 	if rc == nil || rc.Request == nil {
 		return nil, errors.New("elagoht/uploads: Receive needs the request's RenderContext")
 	}
-	r := rc.Request
-	if !markRead(r) {
+	first := false
+	// The function cannot fail, so neither can Once, except for a later
+	// caller whose context ended while waiting; that caller is not first
+	// either way.
+	_, _ = collage.Once(rc, readKey, func(context.Context) (bool, error) {
+		first = true
+		return true, nil
+	})
+	if !first {
 		return nil, ErrAlreadyRead
 	}
-	if err := r.Context().Err(); err != nil {
-		return nil, fmt.Errorf("elagoht/uploads: %w", err)
-	}
 
+	r := rc.Request
 	rv := &receiver{
 		ctx:    rc.Context(),
 		store:  p.store,
@@ -150,19 +147,39 @@ func (p *Plugin) Receive(rc *collage.RenderContext, fields ...FieldSpec) (*Recei
 		rv.rules[f.name] = f.rules
 	}
 
+	// A panic out of the store (or anything under it) still removes what
+	// was stored; it is not recovered, so it goes on as it came.
+	finished := false
+	defer func() {
+		if !finished {
+			_ = rv.discard()
+		}
+	}()
+
 	var err error
 	if r.MultipartForm != nil {
+		// MultipartReader leaves a non-nil, empty MultipartForm behind it;
+		// ParseMultipartForm tells that apart from a parsed form by failing.
+		if perr := r.ParseMultipartForm(0); perr != nil {
+			finished = true
+			return nil, ErrAlreadyRead
+		}
 		err = rv.fromForm(r.MultipartForm)
 	} else {
 		err = rv.fromStream(r)
 	}
-	if err != nil {
-		if derr := rv.discard(); derr != nil {
-			err = errors.Join(err, derr)
-		}
-		return nil, err
+	finished = true
+	if err == nil {
+		return rv.out, nil
 	}
-	return rv.out, nil
+	if derr := rv.discard(); derr != nil {
+		err = errors.Join(err, derr)
+	}
+	var rule *Error
+	if errors.As(err, &rule) {
+		return &Received{Files: map[string][]File{}, Values: rv.out.Values}, err
+	}
+	return nil, err
 }
 
 // receiver is the state of one Receive.
@@ -171,7 +188,8 @@ type receiver struct {
 	store      Store
 	rules      map[string]Rules
 	counts     map[string]int // files seen per field
-	valueBytes int            // non-file value bytes seen
+	valueBytes int            // value budget spent
+	parts      int            // parts read on the stream path
 	keys       []string       // stored so far, deleted on failure
 	out        *Received
 }
@@ -179,13 +197,8 @@ type receiver struct {
 // fromForm reads a form the application parsed: its values, then its files,
 // field by field in name order.
 func (v *receiver) fromForm(form *multipart.Form) error {
-	for _, name := range sortedKeys(form.Value) {
-		for _, val := range form.Value[name] {
-			if err := v.addValue(name, len(val)); err != nil {
-				return err
-			}
-			v.out.Values.Add(name, val)
-		}
+	if err := v.addValues(form.Value); err != nil {
+		return err
 	}
 	// Every undeclared field first, so nothing is stored for a submission
 	// that is refused anyway.
@@ -205,6 +218,19 @@ func (v *receiver) fromForm(form *multipart.Form) error {
 	return nil
 }
 
+// addValues adds values parsed elsewhere, in name order, against the budget.
+func (v *receiver) addValues(values map[string][]string) error {
+	for _, name := range sortedKeys(values) {
+		for _, val := range values[name] {
+			if err := v.charge(name, len(name)+valuePartOverhead+len(val)); err != nil {
+				return err
+			}
+			v.out.Values.Add(name, val)
+		}
+	}
+	return nil
+}
+
 func (v *receiver) openFile(name string, fh *multipart.FileHeader) error {
 	// The count before the open, as the stream path counts before it reads.
 	if err := v.count(name); err != nil {
@@ -219,6 +245,10 @@ func (v *receiver) openFile(name string, fh *multipart.FileHeader) error {
 }
 
 // fromStream walks the body part by part, in the order the client sent them.
+//
+// A part is never closed: Close reads it to its end, which for a refused
+// part is exactly the reading a refusal should spare, and NextPart skips
+// whatever an accepted part left unread anyway.
 func (v *receiver) fromStream(r *http.Request) error {
 	// MultipartReader marks the request as read by the multipart reader
 	// before it looks at the Content-Type, which would leave a form that is
@@ -231,15 +261,7 @@ func (v *receiver) fromStream(r *http.Request) error {
 		mr, err = r.MultipartReader()
 	}
 	if errors.Is(err, http.ErrNotMultipart) {
-		for _, name := range sortedKeys(r.PostForm) {
-			for _, val := range r.PostForm[name] {
-				if err := v.addValue(name, len(val)); err != nil {
-					return err
-				}
-				v.out.Values.Add(name, val)
-			}
-		}
-		return nil
+		return v.addValues(r.PostForm)
 	}
 	if err != nil {
 		return fmt.Errorf("elagoht/uploads: %w", err)
@@ -252,9 +274,11 @@ func (v *receiver) fromStream(r *http.Request) error {
 		if err != nil {
 			return fmt.Errorf("elagoht/uploads: read the body: %w", err)
 		}
-		err = v.streamPart(part)
-		part.Close()
-		if err != nil {
+		v.parts++
+		if v.parts > maxParts {
+			return &Error{Field: part.FormName(), Err: ErrTooLarge}
+		}
+		if err := v.streamPart(part); err != nil {
 			return err
 		}
 	}
@@ -280,23 +304,26 @@ func (v *receiver) streamPart(part *multipart.Part) error {
 	return v.storeFile(name, filename, part)
 }
 
-// readValue reads a value part, never more than the values' remaining budget
-// plus one byte.
+// readValue reads a value part, never more than the budget left plus one
+// byte.
 func (v *receiver) readValue(name string, part io.Reader) error {
+	if err := v.charge(name, len(name)+valuePartOverhead); err != nil {
+		return err
+	}
 	left := int64(maxValueBytes - v.valueBytes)
 	b, err := io.ReadAll(io.LimitReader(part, left+1))
 	if err != nil {
 		return readError(name, err)
 	}
-	if err := v.addValue(name, len(b)); err != nil {
+	if err := v.charge(name, len(b)); err != nil {
 		return err
 	}
 	v.out.Values.Add(name, string(b))
 	return nil
 }
 
-// addValue counts n value bytes against the 64 KiB budget.
-func (v *receiver) addValue(name string, n int) error {
+// charge spends n bytes of the values budget on field name.
+func (v *receiver) charge(name string, n int) error {
 	v.valueBytes += n
 	if v.valueBytes > maxValueBytes {
 		return &Error{Field: name, Err: ErrTooLarge}
@@ -319,7 +346,9 @@ func (v *receiver) count(name string) error {
 }
 
 // storeFile sniffs src, checks its type, and streams it to the store under a
-// fresh key, counting and hashing it on the way.
+// fresh key, counting and hashing it on the way. A Put that succeeds is
+// checked against what was read: the store is not trusted to have honoured
+// the reader's refusal, to have read to the end, or to report the size.
 func (v *receiver) storeFile(name, filename string, src io.Reader) error {
 	rules := v.rules[name]
 	head, typ, err := sniff(src)
@@ -335,6 +364,11 @@ func (v *receiver) storeFile(name, filename string, src io.Reader) error {
 	}
 	fr := newFileReader(head, src, rules.MaxSize)
 	n, err := v.store.Put(v.ctx, key, fr)
+	if err == nil {
+		// Stored, so deleted with the rest if what follows refuses it.
+		v.keys = append(v.keys, key)
+		err = fr.verify(n)
+	}
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if !errors.As(err, &mbe) && (fr.tooLarge || errors.Is(err, errFileTooLarge)) {
@@ -342,7 +376,6 @@ func (v *receiver) storeFile(name, filename string, src io.Reader) error {
 		}
 		return readError(name, err)
 	}
-	v.keys = append(v.keys, key)
 	v.out.Files[name] = append(v.out.Files[name], File{
 		Key:    key,
 		Name:   cleanName(filename),
