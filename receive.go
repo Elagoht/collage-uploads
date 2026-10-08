@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -72,7 +73,12 @@ type Received struct {
 // Receives on one request race-free: exactly one wins. The marker is set
 // before anything is read and stays when Receive returns, failed or not, so a
 // later Receive sees it. It is removed when the request's context ends, which
-// for a served request is when its handler returns.
+// for a served request is when its handler returns, but can be sooner: a reset
+// stream or a deadline ends it mid-handler. So Receive checks the context right
+// after marking: the marker is deleted only once the context is done, so a call
+// that finds no marker after that sees a non-nil Err and stops there, rather
+// than reading the body again or mistaking the sentinel MultipartReader leaves
+// in MultipartForm for a parsed form.
 //
 // A plain map under a mutex rather than a sync.Map, whose API is any-typed;
 // and not a collage Key on the RenderContext, whose Get then Set is not
@@ -128,6 +134,9 @@ func (p *Plugin) Receive(rc *collage.RenderContext, fields ...FieldSpec) (*Recei
 	r := rc.Request
 	if !markRead(r) {
 		return nil, ErrAlreadyRead
+	}
+	if err := r.Context().Err(); err != nil {
+		return nil, fmt.Errorf("elagoht/uploads: %w", err)
 	}
 
 	rv := &receiver{
@@ -211,7 +220,16 @@ func (v *receiver) openFile(name string, fh *multipart.FileHeader) error {
 
 // fromStream walks the body part by part, in the order the client sent them.
 func (v *receiver) fromStream(r *http.Request) error {
-	mr, err := r.MultipartReader()
+	// MultipartReader marks the request as read by the multipart reader
+	// before it looks at the Content-Type, which would leave a form that is
+	// not multipart unparseable for the application. So the type is checked
+	// here first, the way MultipartReader checks it.
+	var mr *multipart.Reader
+	var err error = http.ErrNotMultipart
+	if media, _, perr := mime.ParseMediaType(r.Header.Get("Content-Type")); perr == nil &&
+		(media == "multipart/form-data" || media == "multipart/mixed") {
+		mr, err = r.MultipartReader()
+	}
 	if errors.Is(err, http.ErrNotMultipart) {
 		for _, name := range sortedKeys(r.PostForm) {
 			for _, val := range r.PostForm[name] {

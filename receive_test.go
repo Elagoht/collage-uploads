@@ -23,6 +23,7 @@ import (
 	"testing"
 	"testing/fstest"
 	"testing/iotest"
+	"time"
 
 	"github.com/Elagoht/collage/pkg/collage"
 )
@@ -769,5 +770,70 @@ func TestSniff(t *testing.T) {
 	_, _, err = sniff(&failingBody{data: []byte("ten bytes!"), err: io.ErrUnexpectedEOF})
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Errorf("cut off: err = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
+// A request whose context ended mid-handler (a reset stream, a deadline) loses
+// its marker; a Receive after that must still not read the body again, nor take
+// the sentinel MultipartReader left behind for a parsed form.
+func TestReceive_AlreadyReadAfterCancel(t *testing.T) {
+	p, _ := newDirPlugin(t)
+	body, ct := multipartBody(t, file("f", "a.txt", []byte("once")))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var second error
+	var secondGot *Received
+	h, err := app(t, p, false, nil, func(rc *collage.RenderContext) {
+		if _, err := p.Receive(rc, Field("f", Rules{})); err != nil {
+			t.Errorf("first Receive: %v", err)
+		}
+		cancel()
+		if rc.Request.Context().Err() == nil {
+			t.Fatal("the handler's request does not derive its context from the test's")
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			consumed.mu.Lock()
+			_, marked := consumed.m[rc.Request]
+			consumed.mu.Unlock()
+			if !marked {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the marker outlived the request's context")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		secondGot, second = p.Receive(rc, Field("f", Rules{}))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/upload", bytes.NewReader(body)).WithContext(ctx)
+	r.Host = "localhost:3000"
+	r.Header.Set("Content-Type", ct)
+	h.ServeHTTP(httptest.NewRecorder(), r)
+	if second == nil {
+		t.Errorf("second Receive after the context ended succeeded: %+v", secondGot)
+	}
+}
+
+// Receive on a request that is not multipart leaves its body for the
+// application's own form parsing.
+func TestReceive_NotMultipartLeavesForm(t *testing.T) {
+	p, _ := newDirPlugin(t)
+	var a string
+	h, err := app(t, p, false, nil, func(rc *collage.RenderContext) {
+		if _, err := p.Receive(rc); err != nil {
+			t.Errorf("Receive: %v", err)
+		}
+		a = rc.Request.FormValue("a")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post(h, strings.NewReader("a=1"), "application/x-www-form-urlencoded")
+	if a != "1" {
+		t.Errorf("FormValue after Receive = %q, want 1", a)
 	}
 }
