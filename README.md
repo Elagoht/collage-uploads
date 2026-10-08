@@ -302,11 +302,14 @@ tries again.
 
 Give the upload action its own deadline with `WithBodyTimeout(d)` (collage
 v0.57.0) rather than raising the server's. Both deadlines become now plus `d` for
-that action alone, once its page's guards have let the request through. Choose
-`d` to cover the whole upload and the answer: at least `MaxBodyBytes` divided by
-the slowest connection you serve. A client that goes away mid-upload, or runs out
-of time, is answered `400` or `408`, `Receive` deletes what it stored, and collage
-logs it at debug rather than as a server error.
+that action alone, after its page's guards and, on a streaming action, after the
+`X-CSRF-Token` check, so a request without a token is refused under the server's
+deadlines. Choose `d` to cover the whole upload and the answer: at least
+`MaxBodyBytes` divided by the slowest connection you serve. When a client goes
+away mid-upload, or runs out of time, `Receive` deletes what it stored, and collage
+records a `400` or `408` and logs it at debug rather than as a server error. The
+client itself usually receives nothing: it is gone, or its write deadline passed
+with the read one.
 
 ## Behind a proxy
 
@@ -341,8 +344,10 @@ is the first thing an abuser looks for.
 
 - **Guard the action.** The example above has no guard. A CSRF token is not
   authentication: anyone who loads the form page gets one. Put the upload action
-  on a page behind a session or auth guard, so an anonymous client cannot store
-  anything.
+  on a page behind a session or auth guard, or behind an auth middleware, so an
+  anonymous client cannot store anything. An action registered on its own has no
+  page guards, and a check inside the handler runs only after `WithBodyTimeout`
+  has granted the long deadline.
 - **Quotas are the application's.** The plugin has no notion of a user. Check
   each user's total in the handler before calling `Receive`, from your database;
   `rc.Request.ContentLength`, when the client sends it, is an upper bound to check
