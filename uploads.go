@@ -16,7 +16,7 @@ import (
 // plugin configuration.
 const Name = "elagoht/uploads"
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 // defaultDir is where the disk store keeps files when the plugin was built
 // without a store and nothing configures a directory.

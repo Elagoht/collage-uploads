@@ -9,7 +9,7 @@ part by part, and both give the same result.
 go get github.com/Elagoht/collage-uploads
 ```
 
-Requires collage v0.57.0 or later, whose `WithStreamingBody()` lets an action
+Requires collage v0.58.0 or later, whose `WithStreamingBody()` lets an action
 receive its body unread.
 
 ```go
@@ -384,3 +384,10 @@ is the first thing an abuser looks for.
 - Virus scanning.
 - Client-side progress UI.
 - Quotas and per-user limits (see [Abuse and disk](#abuse-and-disk)).
+
+## Changes
+
+### v0.1.1
+
+- collage.json is regenerated for editors. Nothing else changes.
+- Requires collage v0.58.0.
