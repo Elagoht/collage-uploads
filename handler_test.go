@@ -30,7 +30,7 @@ func putFile(t *testing.T, key string, data []byte) *Plugin {
 	if _, err := store.Put(context.Background(), key, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
-	return New(store)
+	return New(Options{Store: store})
 }
 
 func get(h http.Handler, method, target string, header http.Header) *httptest.ResponseRecorder {
@@ -198,7 +198,7 @@ func TestHandler_NotFoundAndBadKey(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "store", "Upper.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	h := New(store).Handler()
+	h := New(Options{Store: store}).Handler()
 
 	for _, target := range []string{
 		"/uploads/" + strings.Repeat("c", 32) + ".txt", // missing
@@ -244,7 +244,7 @@ func TestHandler_DirAndSymlinkNotFound(t *testing.T) {
 	if err := os.Symlink(filepath.Join(dir, "target.txt"), filepath.Join(dir, "link.txt")); err != nil {
 		t.Fatal(err)
 	}
-	h := New(Dir(dir)).Handler()
+	h := New(Options{Store: Dir(dir)}).Handler()
 	for _, key := range []string{"sub", "link.txt"} {
 		if w := get(h, http.MethodGet, "/uploads/"+key, nil); w.Code != http.StatusNotFound {
 			t.Errorf("%s: status = %d, want 404", key, w.Code)
@@ -254,7 +254,7 @@ func TestHandler_DirAndSymlinkNotFound(t *testing.T) {
 
 // A store directory that was never created is a 404, not a 500.
 func TestHandler_MissingStoreDir(t *testing.T) {
-	h := New(Dir(filepath.Join(t.TempDir(), "nope"))).Handler()
+	h := New(Options{Store: Dir(filepath.Join(t.TempDir(), "nope"))}).Handler()
 	if w := get(h, http.MethodGet, "/uploads/abc.png", nil); w.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", w.Code)
 	}
@@ -289,15 +289,30 @@ func TestHandler_Methods(t *testing.T) {
 }
 
 func TestHandler_CacheControlOption(t *testing.T) {
-	p := putFile(t, "a.txt", []byte("hello"))
-	w := get(p.Handler(HandlerOptions{CacheControl: "public, max-age=31536000, immutable"}), http.MethodGet, "/uploads/a.txt", nil)
+	store := putFile(t, "a.txt", []byte("hello")).Store()
+	p := New(Options{Store: store, CacheControl: "public, max-age=31536000, immutable"})
+	w := get(p.Handler(), http.MethodGet, "/uploads/a.txt", nil)
 	if got := w.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
 		t.Errorf("Cache-Control = %q", got)
 	}
 	// An empty option keeps the default.
-	w = get(p.Handler(HandlerOptions{}), http.MethodGet, "/uploads/a.txt", nil)
+	w = get(New(Options{Store: store}).Handler(), http.MethodGet, "/uploads/a.txt", nil)
 	if got := w.Header().Get("Cache-Control"); got != "private, max-age=0" {
 		t.Errorf("empty option: Cache-Control = %q, want the default", got)
+	}
+}
+
+// cacheControl comes from plugins-config.json too, for a Handler built before
+// Init read it, and with a store given in Go.
+func TestHandler_CacheControlFromConfig(t *testing.T) {
+	p := New(Options{Store: putFile(t, "a.txt", []byte("hello")).Store()})
+	h := p.Handler()
+	if _, err := app(t, p, false, `{"cacheControl": "public, max-age=60"}`, func(*collage.RenderContext) {}); err != nil {
+		t.Fatal(err)
+	}
+	w := get(h, http.MethodGet, "/uploads/a.txt", nil)
+	if got := w.Header().Get("Cache-Control"); got != "public, max-age=60" {
+		t.Errorf("Cache-Control = %q, want the configured one", got)
 	}
 }
 
@@ -341,7 +356,7 @@ func TestHandler_NonSeekableStore(t *testing.T) {
 	if _, err := store.Put(context.Background(), key, strings.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
-	h := New(streamStore{store}).Handler()
+	h := New(Options{Store: streamStore{store}}).Handler()
 
 	w := get(h, http.MethodGet, "/uploads/"+key, http.Header{"Range": {"bytes=20-"}})
 	if w.Code != http.StatusOK {
@@ -390,7 +405,7 @@ func TestHandler_StoreErrorIs500AndLogged(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			var logs bytes.Buffer
-			p := New(store)
+			p := New(Options{Store: store})
 			a, err := collage.New(&collage.Config{
 				Server:   collage.ServerConfig{Host: "localhost", Port: 3000},
 				Template: collage.TemplateConfig{FS: fstest.MapFS{"t/p.html": {Data: []byte(`<p>x</p>`)}}, Root: "t"},
@@ -428,7 +443,7 @@ func TestHandler_StoreErrorIs500AndLogged(t *testing.T) {
 
 // Without Init, the handler still answers, logging through slog.Default.
 func TestHandler_WithoutInit(t *testing.T) {
-	w := get(New(brokenStore{}).Handler(), http.MethodGet, "/uploads/abc.png", nil)
+	w := get(New(Options{Store: brokenStore{}}).Handler(), http.MethodGet, "/uploads/abc.png", nil)
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
 	}
@@ -436,7 +451,7 @@ func TestHandler_WithoutInit(t *testing.T) {
 
 // Before Init built a store, there is nothing to serve.
 func TestHandler_NoStore(t *testing.T) {
-	w := get(NewWith(Config{}).Handler(), http.MethodGet, "/uploads/abc.png", nil)
+	w := get(New(Options{}).Handler(), http.MethodGet, "/uploads/abc.png", nil)
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
 	}
@@ -477,7 +492,7 @@ func TestHandler_MountedInApp(t *testing.T) {
 	if _, err := store.Put(ctx, "evil.png", strings.NewReader(svgXML)); err != nil {
 		t.Fatal(err)
 	}
-	p := New(store)
+	p := New(Options{Store: store})
 	a, err := collage.New(&collage.Config{
 		Server:   collage.ServerConfig{Host: "localhost", Port: 3000},
 		Template: collage.TemplateConfig{FS: fstest.MapFS{"t/p.html": {Data: []byte(`<p>x</p>`)}}, Root: "t"},
@@ -554,7 +569,7 @@ func TestHandler_SeekErrorNotLeaked(t *testing.T) {
 		name, rng := tc.name, tc.rng
 		t.Run(name, func(t *testing.T) {
 			var logs bytes.Buffer
-			p := New(flakySeekStore{data: data, ok: tc.ok})
+			p := New(Options{Store: flakySeekStore{data: data, ok: tc.ok}})
 			p.log = slog.New(slog.NewTextHandler(&logs, nil))
 			hdr := http.Header{}
 			if rng != "" {

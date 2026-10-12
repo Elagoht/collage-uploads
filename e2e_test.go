@@ -86,7 +86,7 @@ func startE2E(t *testing.T, limit int64, maxFiles int, devMode bool) *e2eServer 
 		received: make(chan error, 4),
 		logs:     &lockedBuffer{},
 	}
-	u := New(Dir(s.store))
+	u := New(Options{Store: Dir(s.store)})
 	t.Cleanup(func() {
 		if t.Failed() {
 			t.Logf("the application logged:\n%s", s.logs)

@@ -118,10 +118,10 @@ var readKey = collage.NewKey[bool]("elagoht/uploads:read")
 // the RenderContext collage built; a hand-built one has nowhere to keep it.
 func (p *Plugin) Receive(rc *collage.RenderContext, fields ...FieldSpec) (*Received, error) {
 	if p.store == nil {
-		return nil, errors.New("elagoht/uploads: no store: register the plugin, or pass a store to New")
+		return nil, errors.New("uploads: no store: register the plugin, or set Options.Store")
 	}
 	if rc == nil || rc.Request == nil {
-		return nil, errors.New("elagoht/uploads: Receive needs the request's RenderContext")
+		return nil, errors.New("uploads: Receive needs the request's RenderContext")
 	}
 	first := false
 	// The function cannot fail, so neither can Once, except for a later
@@ -238,7 +238,7 @@ func (v *receiver) openFile(name string, fh *multipart.FileHeader) error {
 	}
 	f, err := fh.Open()
 	if err != nil {
-		return fmt.Errorf("elagoht/uploads: open field %q: %w", name, err)
+		return fmt.Errorf("uploads: open field %q: %w", name, err)
 	}
 	defer f.Close()
 	return v.storeFile(name, fh.Filename, f)
@@ -264,7 +264,7 @@ func (v *receiver) fromStream(r *http.Request) error {
 		return v.addValues(r.PostForm)
 	}
 	if err != nil {
-		return fmt.Errorf("elagoht/uploads: %w", err)
+		return fmt.Errorf("uploads: %w", err)
 	}
 	for {
 		part, err := mr.NextPart()
@@ -272,7 +272,7 @@ func (v *receiver) fromStream(r *http.Request) error {
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("elagoht/uploads: read the body: %w", err)
+			return fmt.Errorf("uploads: read the body: %w", err)
 		}
 		v.parts++
 		if v.parts > maxParts {
@@ -360,7 +360,7 @@ func (v *receiver) storeFile(name, filename string, src io.Reader) error {
 	}
 	key, err := newKey(typ)
 	if err != nil {
-		return fmt.Errorf("elagoht/uploads: field %q: %w", name, err)
+		return fmt.Errorf("uploads: field %q: %w", name, err)
 	}
 	fr := newFileReader(head, src, rules.MaxSize)
 	n, err := v.store.Put(v.ctx, key, fr)
@@ -394,7 +394,7 @@ func (v *receiver) discard() error {
 	var errs []error
 	for _, key := range v.keys {
 		if err := v.store.Delete(ctx, key); err != nil {
-			errs = append(errs, fmt.Errorf("elagoht/uploads: delete %s after a failed Receive: %w", key, err))
+			errs = append(errs, fmt.Errorf("uploads: delete %s after a failed Receive: %w", key, err))
 		}
 	}
 	v.keys = nil
@@ -404,7 +404,7 @@ func (v *receiver) discard() error {
 // readError wraps an error reading or storing field name's data. A
 // *http.MaxBytesError stays reachable through it, so collage answers 413.
 func readError(name string, err error) error {
-	return fmt.Errorf("elagoht/uploads: field %q: %w", name, err)
+	return fmt.Errorf("uploads: field %q: %w", name, err)
 }
 
 // allowed reports whether the sniffed type is one of types, compared without

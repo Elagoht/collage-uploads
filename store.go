@@ -20,11 +20,11 @@ type Store interface {
 
 var (
 	// ErrExists is returned by Put when the key is already stored.
-	ErrExists = errors.New("elagoht/uploads: key exists")
+	ErrExists = errors.New("uploads: key exists")
 	// ErrBadKey is returned for a key outside the portable allowlist:
 	// 1-255 bytes of [a-z0-9_.-], no leading or trailing ".", no "..", and
 	// not a Windows reserved device name.
-	ErrBadKey = errors.New("elagoht/uploads: invalid key")
+	ErrBadKey = errors.New("uploads: invalid key")
 )
 
 // Dir returns a Store that keeps each file as path/key. The directory is
@@ -178,11 +178,11 @@ func (d *dirStore) ensureDir() error {
 		return err
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("elagoht/uploads: %s is not a directory", d.path)
+		return fmt.Errorf("uploads: %s is not a directory", d.path)
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		if err := os.Chmod(d.path, 0o700); err != nil {
-			return fmt.Errorf("elagoht/uploads: tighten %s to 0700: %w", d.path, err)
+			return fmt.Errorf("uploads: tighten %s to 0700: %w", d.path, err)
 		}
 	}
 	return nil
@@ -256,7 +256,7 @@ func (d *dirStore) Delete(ctx context.Context, key string) error {
 		return err
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("elagoht/uploads: delete %s: not a regular file", key)
+		return fmt.Errorf("uploads: delete %s: not a regular file", key)
 	}
 	err = root.Remove(key)
 	if errors.Is(err, fs.ErrNotExist) {

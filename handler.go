@@ -16,13 +16,6 @@ import (
 // cache must not keep it at all.
 const defaultCacheControl = "private, max-age=0"
 
-// HandlerOptions configure a Handler.
-type HandlerOptions struct {
-	// CacheControl is the Cache-Control header sent with every file. Empty
-	// means "private, max-age=0".
-	CacheControl string
-}
-
 // Handler returns an http.Handler that serves stored files by key, for GET
 // and HEAD (any other method is 405). Mount it under a prefix ending in "/":
 //
@@ -42,26 +35,20 @@ type HandlerOptions struct {
 //   - Content-Disposition: attachment, with the key as the file name, for
 //     everything except image/png, image/jpeg, image/gif and image/webp, which
 //     are shown inline (SVG and HTML are always attachments);
-//   - Cache-Control: "private, max-age=0", or opts' CacheControl.
+//   - Cache-Control: Options.CacheControl, "private, max-age=0" by default.
 //
 // When the store's reader can seek (Dir's can), a single Range and
 // conditional requests are answered by http.ServeContent, with those headers
 // kept. A request for several ranges is served whole, since a
 // multipart/byteranges answer would replace the sniffed Content-Type. A
 // reader that cannot seek is copied whole, and a Range is ignored.
-func (p *Plugin) Handler(opts ...HandlerOptions) http.Handler {
-	cacheControl := defaultCacheControl
-	for _, o := range opts {
-		if o.CacheControl != "" {
-			cacheControl = o.CacheControl
-		}
-	}
-	return &handler{p: p, cacheControl: cacheControl}
-}
+//
+// The handler may be built before Init: it reads the store and CacheControl
+// when it serves.
+func (p *Plugin) Handler() http.Handler { return &handler{p: p} }
 
 type handler struct {
-	p            *Plugin
-	cacheControl string
+	p *Plugin
 }
 
 // inline reports whether a sniffed type is a raster image a browser may
@@ -92,7 +79,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	store := h.p.store
 	if store == nil {
-		h.fail(w, r, key, errors.New("elagoht/uploads: no store: the plugin has not been initialised"))
+		h.fail(w, r, key, errors.New("uploads: no store: the plugin has not been initialised"))
 		return
 	}
 	body, err := store.Open(r.Context(), key)
@@ -124,7 +111,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	hdr.Set("Content-Type", contentType)
 	hdr.Set("X-Content-Type-Options", "nosniff")
 	hdr.Set("Content-Security-Policy", "sandbox")
-	hdr.Set("Cache-Control", h.cacheControl)
+	cacheControl := h.p.opts.CacheControl
+	if cacheControl == "" {
+		cacheControl = defaultCacheControl
+	}
+	hdr.Set("Cache-Control", cacheControl)
 	if !inline(contentType) {
 		// validKey allows no quote, backslash or control character, so the
 		// key needs no escaping inside the quotes.
@@ -173,13 +164,13 @@ func (h *handler) logError(r *http.Request, key string, err error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	log.ErrorContext(r.Context(), "elagoht/uploads: serving a file failed", "key", key, "error", err)
+	log.ErrorContext(r.Context(), "uploads: serving a file failed", "key", key, "error", err)
 }
 
 // errSeek is what ServeContent sees when a seek fails. ServeContent writes a
 // failed range seek's error into the response body, and a store's error can
 // name a path on the server, so the real one is only logged.
-var errSeek = errors.New("elagoht/uploads: seek failed")
+var errSeek = errors.New("uploads: seek failed")
 
 // quietSeeker logs a failed seek and hands ServeContent errSeek instead.
 type quietSeeker struct {

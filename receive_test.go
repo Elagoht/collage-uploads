@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -21,10 +20,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"testing/fstest"
 	"testing/iotest"
 
 	"github.com/Elagoht/collage/pkg/collage"
+	"github.com/Elagoht/collage/pkg/collagetest"
 )
 
 // part is one part of a multipart body. An empty filename makes it a plain
@@ -83,21 +82,13 @@ func pngBytes(t *testing.T) []byte {
 	return b.Bytes()
 }
 
-// app builds a collage application with p registered and one POST action at
+// app builds a collage application with p registered, configured by config
+// (its plugins-config.json section, "" for none), and one POST action at
 // /upload whose handler runs inside. The action streams its body unless
 // parsed is set; with parsed, the handler parses the multipart form itself
 // before inside runs, as an application on the ordinary path would.
-func app(t *testing.T, p *Plugin, parsed bool, pluginConfig map[string]json.RawMessage, inside func(rc *collage.RenderContext)) (http.Handler, error) {
+func app(t *testing.T, p *Plugin, parsed bool, config string, inside func(rc *collage.RenderContext)) (http.Handler, error) {
 	t.Helper()
-	a, err := collage.New(&collage.Config{
-		Server:       collage.ServerConfig{Host: "localhost", Port: 3000},
-		Template:     collage.TemplateConfig{FS: fstest.MapFS{"t/p.html": {Data: []byte(`<p>x</p>`)}}, Root: "t"},
-		Plugins:      []collage.Plugin{p},
-		PluginConfig: pluginConfig,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	// A limit above the largest body a test sends, so the parsed path can
 	// parse every one of them.
 	b := collage.NewAction("upload").WithPath("en", "/upload").WithMethods(http.MethodPost).WithoutCSRF().
@@ -120,13 +111,15 @@ func app(t *testing.T, p *Plugin, parsed bool, pluginConfig map[string]json.RawM
 		inside(rc)
 		return nil, nil
 	})
-	if err := a.RegisterAction(b.Build()); err != nil {
-		t.Fatal(err)
+	options := []collagetest.SiteOption{collagetest.WithPlugins(p), collagetest.WithRegister(b.Build())}
+	if config != "" {
+		options = append(options, collagetest.WithPluginConfig(Name, config))
 	}
-	if err := a.Start(); err != nil {
+	site, err := collagetest.TrySite(t, options...)
+	if err != nil {
 		return nil, err
 	}
-	return a.Handler(), nil
+	return site.App.Handler(), nil
 }
 
 // post sends body to /upload on h.
@@ -145,7 +138,7 @@ func receive(t *testing.T, p *Plugin, parsed bool, body io.Reader, contentType s
 	var got *Received
 	var err error
 	ran := false
-	h, startErr := app(t, p, parsed, nil, func(rc *collage.RenderContext) {
+	h, startErr := app(t, p, parsed, "", func(rc *collage.RenderContext) {
 		ran = true
 		got, err = p.Receive(rc, specs...)
 	})
@@ -190,7 +183,7 @@ func stored(t *testing.T, dir string) []string {
 func newDirPlugin(t *testing.T) (*Plugin, string) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "uploads")
-	return New(Dir(dir)), dir
+	return New(Options{Store: Dir(dir)}), dir
 }
 
 // wantRule checks err is an *Error for field wrapping rule.
@@ -588,7 +581,7 @@ func TestReceive_AlreadyRead(t *testing.T) {
 			body, ct := multipartBody(t, file("f", "a.txt", []byte("once")))
 			var first, second error
 			var firstGot *Received
-			h, err := app(t, p, path.parsed, nil, func(rc *collage.RenderContext) {
+			h, err := app(t, p, path.parsed, "", func(rc *collage.RenderContext) {
 				firstGot, first = p.Receive(rc, Field("f", Rules{}))
 				_, second = p.Receive(rc, Field("f", Rules{}))
 			})
@@ -611,7 +604,7 @@ func TestReceive_AlreadyReadAfterFailure(t *testing.T) {
 	p, _ := newDirPlugin(t)
 	body, ct := multipartBody(t, file("other", "a.txt", []byte("x")))
 	var second error
-	h, err := app(t, p, false, nil, func(rc *collage.RenderContext) {
+	h, err := app(t, p, false, "", func(rc *collage.RenderContext) {
 		if _, err := p.Receive(rc, Field("f", Rules{})); err == nil {
 			t.Error("first Receive succeeded")
 		}
@@ -651,25 +644,15 @@ func TestReceive_MaxBytesErrorWrapped(t *testing.T) {
 		file("f", "1.txt", []byte("small")),
 		file("f", "2.txt", bytes.Repeat([]byte("2"), 8000)))
 	var err error
-	a, startErr := collage.New(&collage.Config{
-		Server:   collage.ServerConfig{Host: "localhost", Port: 3000},
-		Template: collage.TemplateConfig{FS: fstest.MapFS{"t/p.html": {Data: []byte(`<p>x</p>`)}}, Root: "t"},
-		Plugins:  []collage.Plugin{p},
-	})
-	if startErr != nil {
-		t.Fatal(startErr)
-	}
 	act := collage.NewAction("upload").WithPath("en", "/upload").WithMethods(http.MethodPost).
 		WithoutCSRF().WithStreamingBody().WithMaxBodyBytes(2000).
 		WithHandler(func(_ context.Context, rc *collage.RenderContext) (*collage.ActionResult, error) {
 			_, err = p.Receive(rc, Field("f", Rules{MaxFiles: 2}))
 			return nil, err
 		})
-	if err := a.RegisterAction(act.Build()); err != nil {
-		t.Fatal(err)
-	}
+	site := collagetest.NewSite(t, collagetest.WithPlugins(p), collagetest.WithRegister(act.Build()))
 	// No Content-Length, so the bound is hit while Receive reads, not up front.
-	w := post(a.Handler(), io.MultiReader(bytes.NewReader(body)), ct)
+	w := post(site.App.Handler(), io.MultiReader(bytes.NewReader(body)), ct)
 	var mbe *http.MaxBytesError
 	if !errors.As(err, &mbe) {
 		t.Fatalf("err = %v, want a wrapped *http.MaxBytesError", err)
@@ -687,7 +670,7 @@ func TestReceive_MaxBytesErrorWrapped(t *testing.T) {
 }
 
 func TestReceive_NoStore(t *testing.T) {
-	p := NewWith(Config{})
+	p := New(Options{})
 	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
 	if _, err := p.Receive(&collage.RenderContext{Request: r}); err == nil {
 		t.Error("Receive on a plugin with no store succeeded")
@@ -699,19 +682,18 @@ func TestError(t *testing.T) {
 	if !errors.Is(err, ErrTooLarge) {
 		t.Error("Error does not unwrap to its rule")
 	}
-	if msg := err.Error(); !strings.HasPrefix(msg, "elagoht/uploads: ") || !strings.Contains(msg, "avatar") {
+	if msg := err.Error(); !strings.HasPrefix(msg, "uploads: ") || !strings.Contains(msg, "avatar") {
 		t.Errorf("Error() = %q", msg)
 	}
 	for _, e := range []error{ErrTooLarge, ErrType, ErrTooMany, ErrUnexpectedField, ErrAlreadyRead} {
-		if !strings.HasPrefix(e.Error(), "elagoht/uploads: ") {
+		if !strings.HasPrefix(e.Error(), "uploads: ") {
 			t.Errorf("%q lacks the prefix", e.Error())
 		}
 	}
 }
 
 func TestInit_NeedsStore(t *testing.T) {
-	cfg := map[string]json.RawMessage{Name: json.RawMessage(`{"dir": ""}`)}
-	_, err := app(t, NewWith(Config{}), false, cfg, func(*collage.RenderContext) {})
+	_, err := app(t, New(Options{}), false, `{"dir": ""}`, func(*collage.RenderContext) {})
 	if err == nil {
 		t.Fatal("Init succeeded with neither a store nor a dir")
 	}
@@ -728,19 +710,18 @@ func TestNew_DirFromConfig(t *testing.T) {
 	}
 	t.Run("config section", func(t *testing.T) {
 		want := filepath.Join(t.TempDir(), "from-config")
-		cfg := map[string]json.RawMessage{Name: json.RawMessage(fmt.Sprintf(`{"dir": %q}`, want))}
-		p := New(nil)
-		if _, err := app(t, p, false, cfg, func(*collage.RenderContext) {}); err != nil {
+		p := New(Options{})
+		if _, err := app(t, p, false, fmt.Sprintf(`{"dir": %q}`, want), func(*collage.RenderContext) {}); err != nil {
 			t.Fatal(err)
 		}
 		if got := dirOf(t, p); got != want {
 			t.Errorf("dir = %q, want %q", got, want)
 		}
 	})
-	t.Run("NewWith", func(t *testing.T) {
+	t.Run("Options.Dir", func(t *testing.T) {
 		want := filepath.Join(t.TempDir(), "from-code")
-		p := NewWith(Config{Dir: want})
-		if _, err := app(t, p, false, nil, func(*collage.RenderContext) {}); err != nil {
+		p := New(Options{Dir: want})
+		if _, err := app(t, p, false, "", func(*collage.RenderContext) {}); err != nil {
 			t.Fatal(err)
 		}
 		if got := dirOf(t, p); got != want {
@@ -748,8 +729,8 @@ func TestNew_DirFromConfig(t *testing.T) {
 		}
 	})
 	t.Run("default", func(t *testing.T) {
-		p := New(nil)
-		if _, err := app(t, p, false, nil, func(*collage.RenderContext) {}); err != nil {
+		p := New(Options{})
+		if _, err := app(t, p, false, "", func(*collage.RenderContext) {}); err != nil {
 			t.Fatal(err)
 		}
 		if got := dirOf(t, p); got != "var/uploads" {
@@ -758,9 +739,8 @@ func TestNew_DirFromConfig(t *testing.T) {
 	})
 	t.Run("a given store is kept", func(t *testing.T) {
 		s := Dir(t.TempDir())
-		cfg := map[string]json.RawMessage{Name: json.RawMessage(`{"dir": "elsewhere"}`)}
-		p := New(s)
-		if _, err := app(t, p, false, cfg, func(*collage.RenderContext) {}); err != nil {
+		p := New(Options{Store: s})
+		if _, err := app(t, p, false, `{"dir": "elsewhere"}`, func(*collage.RenderContext) {}); err != nil {
 			t.Fatal(err)
 		}
 		if p.Store() != s {
@@ -807,7 +787,7 @@ func TestReceive_AlreadyReadAfterCancel(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			var second error
-			h, err := app(t, p, path.parsed, nil, func(rc *collage.RenderContext) {
+			h, err := app(t, p, path.parsed, "", func(rc *collage.RenderContext) {
 				if _, err := p.Receive(rc, Field("f", Rules{})); err != nil {
 					t.Errorf("first Receive: %v", err)
 				}
@@ -836,7 +816,7 @@ func TestReceive_AlreadyReadAfterCancel(t *testing.T) {
 func TestReceive_NotMultipartLeavesForm(t *testing.T) {
 	p, _ := newDirPlugin(t)
 	var a string
-	h, err := app(t, p, false, nil, func(rc *collage.RenderContext) {
+	h, err := app(t, p, false, "", func(rc *collage.RenderContext) {
 		if _, err := p.Receive(rc); err != nil {
 			t.Errorf("Receive: %v", err)
 		}
@@ -871,7 +851,7 @@ func newSpyPlugin(t *testing.T) (*Plugin, *spyStore, string) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "uploads")
 	s := &spyStore{Store: Dir(dir)}
-	return New(s), s, dir
+	return New(Options{Store: s}), s, dir
 }
 
 // valueParts is a multipart body of n empty values, each named by i padded to
@@ -990,7 +970,7 @@ func TestReceive_RefusalStopsReading(t *testing.T) {
 			cr := &countingReader{r: bytes.NewReader(body)}
 			var err error
 			var readAtReturn int64
-			h, startErr := app(t, p, false, nil, func(rc *collage.RenderContext) {
+			h, startErr := app(t, p, false, "", func(rc *collage.RenderContext) {
 				_, err = p.Receive(rc, Field("f", tc.rules))
 				readAtReturn = cr.n
 			})
@@ -1017,7 +997,7 @@ func TestReceive_StorePanicLeavesNothing(t *testing.T) {
 			s.panicAt = 2
 			body, ct := multipartBody(t, file("f", "1.txt", []byte("one")), file("f", "2.txt", []byte("two")))
 			var panicked bool
-			h, err := app(t, p, path.parsed, nil, func(rc *collage.RenderContext) {
+			h, err := app(t, p, path.parsed, "", func(rc *collage.RenderContext) {
 				defer func() {
 					panicked = recover() != nil
 				}()
@@ -1070,7 +1050,7 @@ func TestReceive_DistrustsStore(t *testing.T) {
 			for _, mode := range []string{"swallow", "lie", "quit"} {
 				t.Run(mode, func(t *testing.T) {
 					dir := filepath.Join(t.TempDir(), "uploads")
-					p := New(&untrustedStore{Store: Dir(dir), mode: mode})
+					p := New(Options{Store: &untrustedStore{Store: Dir(dir), mode: mode}})
 					// Over MaxSize for the store that swallows the refusal;
 					// within it for the others, whose lies are about the rest.
 					size := 50
@@ -1094,7 +1074,7 @@ func TestReceive_DistrustsStore(t *testing.T) {
 	}
 	t.Run("stream/swallowed read error", func(t *testing.T) {
 		dir := filepath.Join(t.TempDir(), "uploads")
-		p := New(&untrustedStore{Store: Dir(dir), mode: "swallow"})
+		p := New(Options{Store: &untrustedStore{Store: Dir(dir), mode: "swallow"}})
 		data := bytes.Repeat([]byte("a"), 4000)
 		body, ct := multipartBody(t, file("f", "a.txt", data))
 		cut := bytes.Index(body, data) + 2000
@@ -1164,7 +1144,7 @@ func TestReceive_AfterAppMultipartReader(t *testing.T) {
 	p, _ := newDirPlugin(t)
 	body, ct := multipartBody(t, file("f", "a.txt", []byte("hello")))
 	var err error
-	h, startErr := app(t, p, false, nil, func(rc *collage.RenderContext) {
+	h, startErr := app(t, p, false, "", func(rc *collage.RenderContext) {
 		if _, merr := rc.Request.MultipartReader(); merr != nil {
 			t.Errorf("MultipartReader: %v", merr)
 		}

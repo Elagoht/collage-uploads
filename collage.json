@@ -7,9 +7,13 @@
     "type": "object",
     "description": "A collage plugin that receives file uploads, validates them by their content, stores them under random keys, and serves them back safely.",
     "properties": {
+      "cacheControl": {
+        "type": "string",
+        "description": "CacheControl is the Cache-Control header Handler sends with every file; default \"private, max-age=0\": a browser may keep the file but must revalidate it, and a shared cache must not keep it at all."
+      },
       "dir": {
         "type": "string",
-        "description": "directory of the disk store, used when the plugin is built without a store; default \"var/uploads\""
+        "description": "Dir is the directory of the disk store, used when Store is nil; default \"var/uploads\". A section that sets \"dir\" to \"\" explicitly is a startup error."
       }
     },
     "additionalProperties": false

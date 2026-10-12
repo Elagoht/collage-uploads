@@ -9,11 +9,11 @@ part by part, and both give the same result.
 go get github.com/Elagoht/collage-uploads
 ```
 
-Requires collage v0.58.0 or later, whose `WithStreamingBody()` lets an action
+Requires collage v0.61.0 or later. Its `WithStreamingBody()` lets an action
 receive its body unread.
 
 ```go
-u := uploads.New(uploads.Dir("var/uploads"))
+u := uploads.New(uploads.Options{})
 
 app, err := collage.New(&collage.Config{
 	Plugins: []collage.Plugin{u},
@@ -91,7 +91,9 @@ an error. `Receive` still succeeds, through the parsed path, but by then net/htt
 has written the whole body, up to `MaxBodyBytes`, to temp files under
 `os.TempDir()` — on many Linux hosts a `tmpfs`, and so memory. The other order
 fails instead: after `Receive` has streamed the body, `validate.Form` finds an
-empty form. Read and check the non-file fields from `Received.Values`.
+empty form. Check the non-file fields from `Received.Values` with
+`validate.Values(rc, got.Values)` (collage-validate v0.2.0), which refuses and
+types them back as `validate.Form` does.
 
 ## Rules
 
@@ -204,17 +206,20 @@ record of who uploaded what.
 - **Crashes.** A crash mid-write can leave a `.upload-*` temp file. No key can
   name it, and it is safe to delete.
 
-Built with `New(nil)` or `NewWith`, the plugin makes a `Dir` from its
-configuration:
+With no `Options.Store`, the plugin makes a `Dir` from its configuration:
 
 ```json
 {"elagoht/uploads": {"dir": "var/uploads"}}
 ```
 
-`dir` defaults to `"var/uploads"`, or to what `NewWith` was given. Setting it to
-`""` is a startup error. A store passed to `New` ignores the configuration. Any
-type implementing the `Store` interface (`Put`, `Open`, `Delete`) can stand in
-for `Dir`.
+`dir` defaults to `"var/uploads"`, or to `Options.Dir`. Setting it to `""` is a
+startup error. A store set in `Options.Store` ignores `dir`. Any type
+implementing the `Store` interface (`Put`, `Open`, `Delete`) can stand in for
+`Dir`:
+
+```go
+u := uploads.New(uploads.Options{Store: myStore})
+```
 
 ## Serving
 
@@ -241,13 +246,14 @@ Every file is answered with:
 | `X-Content-Type-Options` | `nosniff` |
 | `Content-Security-Policy` | `sandbox` |
 | `Content-Disposition` | `attachment; filename="<key>"`, except for `image/png`, `image/jpeg`, `image/gif` and `image/webp`, which are inline. SVG and HTML are always attachments |
-| `Cache-Control` | `private, max-age=0`, or `HandlerOptions.CacheControl` |
+| `Cache-Control` | `private, max-age=0`, or `cacheControl` |
 
-```go
-u.Handler(uploads.HandlerOptions{CacheControl: "private, max-age=86400"})
+```json
+{"elagoht/uploads": {"cacheControl": "private, max-age=86400"}}
 ```
 
-An empty `CacheControl` keeps the default. The file name in `Content-Disposition`
+or `uploads.Options{CacheControl: "private, max-age=86400"}` in Go. An empty
+`cacheControl` keeps the default. The file name in `Content-Disposition`
 is the key, since the handler does not know the original name. To download under
 the original name, serve the file from an action of your own that looks the name
 up in your database.
@@ -386,6 +392,20 @@ is the first thing an abuser looks for.
 - Quotas and per-user limits (see [Abuse and disk](#abuse-and-disk)).
 
 ## Changes
+
+### Changed in v0.2.0
+
+- One constructor: `uploads.New(uploads.Options{…})`.
+  - `New(store)` → `New(uploads.Options{Store: store})`.
+  - `NewWith(uploads.Config{Dir: d})` → `New(uploads.Options{Dir: d})`; the type
+    `Config` is now `Options`.
+- `Handler(uploads.HandlerOptions{CacheControl: c})` → `Handler()` with
+  `Options.CacheControl`, or `"cacheControl"` in plugins-config.json.
+  `HandlerOptions` is removed.
+- The configuration is read even when a store is given in Go, so an unknown key
+  stops the application there too.
+- Error messages start with `uploads:` instead of `elagoht/uploads:`.
+- Requires collage v0.61.0.
 
 ### v0.1.1
 

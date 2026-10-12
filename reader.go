@@ -17,7 +17,7 @@ const sniffLen = 512
 
 // errFileTooLarge is what fileReader returns once a file passes its limit.
 // Receive reports it as an *Error wrapping ErrTooLarge.
-var errFileTooLarge = errors.New("elagoht/uploads: file over its size limit")
+var errFileTooLarge = errors.New("uploads: file over its size limit")
 
 // sniff reads up to sniffLen bytes of src and returns them with the type they
 // sniff as. A file shorter than the window is not an error: only io.EOF ends it
@@ -109,9 +109,9 @@ func (f *fileReader) verify(n int64) error {
 	case f.err != nil:
 		return f.err
 	case !f.eof:
-		return errors.New("elagoht/uploads: the store stopped reading before the end of the file")
+		return errors.New("uploads: the store stopped reading before the end of the file")
 	case n != f.n:
-		return fmt.Errorf("elagoht/uploads: the store reported %d bytes stored of %d read", n, f.n)
+		return fmt.Errorf("uploads: the store reported %d bytes stored of %d read", n, f.n)
 	}
 	return nil
 }
