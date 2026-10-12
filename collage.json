@@ -3,6 +3,7 @@
   "name": "elagoht/uploads",
   "description": "A collage plugin that receives file uploads, validates them by their content, stores them under random keys, and serves them back safely.",
   "repository": "https://github.com/Elagoht/collage-uploads",
+  "setup": "Uploads are received and served through the plugin, so keep it in a variable in `plugins.go` — `up := uploads.New(uploads.Options{})` — and put `up` in the plugins list. Serve stored files with `app.Handle(\"/uploads/\", up.Handler())`, and receive them with `up.Receive(rc, uploads.Field(...))` in an action built `WithStreamingBody()`.",
   "config": {
     "type": "object",
     "description": "A collage plugin that receives file uploads, validates them by their content, stores them under random keys, and serves them back safely.",

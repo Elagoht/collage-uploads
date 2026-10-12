@@ -405,6 +405,8 @@ is the first thing an abuser looks for.
 - The configuration is read even when a store is given in Go, so an unknown key
   stops the application there too.
 - Error messages start with `uploads:` instead of `elagoht/uploads:`.
+- collage.json has a setup note: keep the plugin in a variable, mount
+  `Handler()` and call `Receive` in a streaming action.
 - Requires collage v0.61.0.
 
 ### v0.1.1
